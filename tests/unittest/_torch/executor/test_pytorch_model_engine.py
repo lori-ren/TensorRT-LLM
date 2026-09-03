@@ -230,6 +230,9 @@ def _make_forward_only_engine(
         cp_size=1,
         enable_lm_head_tp_in_adp=False,
     )
+    # None, not a Mock: enable_lm_head_tp_in_adp is False above, so the group
+    # all-gather must never be reached. If it ever is, this fails loudly.
+    engine.dist = None
     engine.runtime_draft_len = 0
     engine.attn_backend = None
     engine.original_max_draft_len = 0

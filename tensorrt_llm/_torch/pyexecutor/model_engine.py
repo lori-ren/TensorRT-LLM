@@ -12,7 +12,7 @@ import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import (Any, Callable, Dict, Hashable, List, Optional, Sequence,
-                    Tuple, Type, Union)
+                    Tuple, Union)
 
 import torch
 import torch._dynamo.config
@@ -73,8 +73,7 @@ from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                MoeLoadBalancerIterContext)
 from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
-from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
-                           get_num_extra_kv_tokens, get_spec_metadata,
+from ..speculative import (SpecMetadata, get_num_extra_kv_tokens,
                            prepare_attn_metadata_for_draft_replay,
                            restore_attn_metadata_after_draft_replay,
                            update_spec_config_from_loaded_model)
@@ -87,11 +86,11 @@ from ..utils import (get_model_extra_attrs,
                      set_per_request_prefill_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
 from .breakable_cuda_graph_runner import BreakableCUDAGraphRunner
-from .config_utils import is_mla
 from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 CUDAGraphRunner, CUDAGraphRunnerConfig,
                                 EncoderCUDAGraphRunner,
                                 EncoderCUDAGraphRunnerConfig)
+from .engine import metadata as engine_metadata
 from .guided_decoder import CapturableGuidedDecoder
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
@@ -99,7 +98,7 @@ from .llm_request import (LlmRequest, LlmRequestState,
                           MultimodalEncoderRequestError, _Unset,
                           get_draft_token_length,
                           get_multimodal_embedding_lengths)
-from .mamba_cache_manager import BaseMambaCacheManager, MambaHybridCacheManager
+from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
@@ -116,11 +115,6 @@ def _get_context_prompt_lookahead_token(request: LlmRequest,
     if chunk_end >= request.py_prompt_len:
         return INVALID_PROMPT_LOOKAHEAD_TOKEN
     return request.get_token(0, chunk_end)
-
-
-def resolve_mamba_metadata_cls(model: torch.nn.Module) -> Type[Mamba2Metadata]:
-    """Resolve the model-specific Mamba metadata class with a default."""
-    return getattr(model, 'mamba_metadata_cls', None) or Mamba2Metadata
 
 
 def _make_single_token_context_graph_batch(
@@ -1296,11 +1290,8 @@ class PyTorchModelEngine(ModelEngine):
     def _get_draft_kv_cache_manager(
         self, resource_manager: ResourceManager
     ) -> Optional[Union[KVCacheManager, KVCacheManagerV2]]:
-        """
-        Returns the draft KV cache manager only in one-model speculative decoding
-        mode where the target model manages a separate draft KV cache.
-        """
-        return get_draft_kv_cache_manager(self.spec_config, resource_manager)
+        return engine_metadata.resolve_draft_kv_cache_manager(
+            self.spec_config, resource_manager)
 
     @contextmanager
     def set_warmup_flag(self):
@@ -3561,86 +3552,34 @@ class PyTorchModelEngine(ModelEngine):
                     req.py_is_first_draft = True
                     req.py_draft_tokens = []
 
+    def _attn_metadata_env(self) -> dict:
+        return dict(
+            attn_backend=self.attn_backend,
+            attn_runtime_features=self.attn_runtime_features,
+            sparse_attention_config=self.sparse_attention_config,
+            cache_indirection_attention=self.cache_indirection_attention,
+            batch_size=self.batch_size,
+            max_num_tokens=self.max_num_tokens,
+            max_beam_width=self.max_beam_width,
+            mapping=self.mapping)
+
     def _set_up_attn_metadata(
         self,
         kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
         draft_kv_cache_manager: Optional[Union[KVCacheManager,
                                                KVCacheManagerV2]] = None):
-        enable_context_mla_with_cached_kv = is_mla(
-            self.model.model_config.pretrained_config) and (
-                self.attn_runtime_features.cache_reuse
-                or self.attn_runtime_features.chunked_prefill)
-        cache_indirection = self.cache_indirection_attention if self.attn_backend.Metadata is TrtllmAttentionMetadata else None
-        num_attention_heads = getattr(self.model.model_config.pretrained_config,
-                                      'num_attention_heads', None)
-        config = self.model.model_config.pretrained_config
-
-        num_attention_heads = getattr(config, 'num_attention_heads', None)
-        num_key_value_heads = getattr(config, 'num_key_value_heads', None)
-
-        # Calculate the number of attention heads per KV head (GQA ratio)
-        if isinstance(num_key_value_heads, (list, tuple)):
-            # Filter out invalid KV heads, default to 0 if no valid KV heads are found
-            num_key_value_heads = min(
-                (kv for kv in num_key_value_heads if kv and kv > 0), default=0)
-        if num_attention_heads and num_key_value_heads:
-            num_heads_per_kv = num_attention_heads // num_key_value_heads
-        else:
-            num_heads_per_kv = 1
-
-        metadata_cls = self.attn_backend.Metadata
-        sparse_metadata_params = (
-            self.sparse_attention_config.to_sparse_metadata_params(
-                pretrained_config=config)
-            if self.sparse_attention_config is not None else None)
-
+        # The factory resolves, the engine records. Both memo fields stay
+        # engine attributes: py_executor reads them back with getattr() and
+        # py_executor_creator writes None during the KV-estimation rebuild.
         if kv_cache_manager is None:
-            # Cache the no-cache metadata.
-            if self.encoder_attn_metadata is not None:
-                return self.encoder_attn_metadata
-            self.encoder_attn_metadata = metadata_cls(
-                max_num_requests=self.batch_size,
-                max_num_tokens=self.max_num_tokens,
-                max_num_sequences=self.batch_size * self.max_beam_width,
-                kv_cache_manager=None,
-                mapping=self.mapping,
-                runtime_features=self.attn_runtime_features,
-                enable_flash_mla=self.model.model_config.enable_flash_mla,
-                enable_context_mla_with_cached_kv=
-                enable_context_mla_with_cached_kv,
-                cache_indirection=cache_indirection,
-                num_heads_per_kv=num_heads_per_kv,
-                sparse_metadata_params=sparse_metadata_params)
-            self.encoder_attn_metadata.block_ids_per_seq = None
-            self.encoder_attn_metadata.kv_block_ids_per_seq = None
+            self.encoder_attn_metadata = engine_metadata.set_up_no_cache_attn_metadata(
+                self.model, self.encoder_attn_metadata,
+                **self._attn_metadata_env())
             return self.encoder_attn_metadata
 
-        if self.attn_metadata is not None:
-            # This assertion can be relaxed if needed: just create a new metadata
-            # object if it changes.
-            assert self.attn_metadata.kv_cache_manager is kv_cache_manager
-            return self.attn_metadata
-
-        self.attn_metadata = metadata_cls(
-            max_num_requests=self.batch_size,
-            max_num_tokens=self.max_num_tokens,
-            max_num_sequences=self.batch_size * self.max_beam_width,
-            kv_cache_manager=kv_cache_manager,
-            draft_kv_cache_manager=draft_kv_cache_manager,
-            mapping=self.mapping,
-            runtime_features=self.attn_runtime_features,
-            enable_flash_mla=self.model.model_config.enable_flash_mla,
-            enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
-            cache_indirection=cache_indirection,
-            num_heads_per_kv=num_heads_per_kv,
-            sparse_metadata_params=sparse_metadata_params,
-        )
-        if isinstance(kv_cache_manager, BaseMambaCacheManager):
-            self.attn_metadata.mamba_chunk_size = getattr(
-                config, 'chunk_size', self.attn_metadata.mamba_chunk_size)
-        self.attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(
-            self.model)
-
+        self.attn_metadata = engine_metadata.set_up_attn_metadata(
+            self.model, kv_cache_manager, draft_kv_cache_manager,
+            self.attn_metadata, **self._attn_metadata_env())
         return self.attn_metadata
 
     @property
@@ -3933,35 +3872,14 @@ class PyTorchModelEngine(ModelEngine):
             self,
             spec_resource_manager: Optional[BaseResourceManager],
             no_cache=False):
-        spec_config = self.spec_config if self.enable_spec_decode else None
-        # The disaggregated attention-DP overlap path opts into larger metadata
-        # buffers. Passing None preserves the established max_num_requests
-        # fallback for other configurations, including PP.
-        num_seq_slots = (self.max_num_seq_slots
-                         if self._enable_disagg_adp_overlap_headroom else None)
-        if no_cache:
-            return get_spec_metadata(
-                spec_config,
-                self.model.config,
-                self.batch_size,
-                max_num_tokens=self.max_num_tokens,
-                spec_resource_manager=spec_resource_manager,
-                is_draft_model=self.is_draft_model,
-                max_seq_len=self.max_seq_len,
-                num_seq_slots=num_seq_slots)
-
-        if self.spec_metadata is not None:
-            return self.spec_metadata
-        self.spec_metadata = get_spec_metadata(
-            spec_config,
-            self.model.config,
-            self.batch_size,
-            max_num_tokens=self.max_num_tokens,
-            spec_resource_manager=spec_resource_manager,
-            is_draft_model=self.is_draft_model,
-            max_seq_len=self.max_seq_len,
-            num_seq_slots=num_seq_slots)
-        return self.spec_metadata
+        spec_metadata = engine_metadata.set_up_spec_metadata(
+            self.model, spec_resource_manager, self.spec_metadata, no_cache,
+            self.spec_config, self.enable_spec_decode, self.is_draft_model,
+            self.batch_size, self.max_num_tokens, self.max_seq_len,
+            self.max_num_seq_slots, self._enable_disagg_adp_overlap_headroom)
+        if not no_cache:
+            self.spec_metadata = spec_metadata
+        return spec_metadata
 
     def cleanup(self) -> None:
         """Release resources owned by this model engine.
@@ -4312,32 +4230,8 @@ class PyTorchModelEngine(ModelEngine):
         return cols[0], cols[1:]
 
     def _sync_group_all_greedy_sample(self, spec_metadata) -> None:
-        """All-gather the per-rank greedy flags and store the group AND.
-
-        Why the sampling-path choice must be group-uniform under
-        ADP + LM-head TP is documented on the anchor,
-        ``SpecMetadata.group_all_greedy_sample``. Local contract: called once
-        per iteration, right after ``update_is_all_greedy_sample`` and BEFORE
-        the CUDA graph key is built. The gate is pure config (identical on
-        every rank), so ranks also agree on whether the exchange happens; the
-        gather spans the whole TP group, a superset of any LM-head-TP
-        subgroup. A dedicated host all-gather rather than a piggyback on the
-        ``all_rank_num_tokens`` exchange, which runs in ``_prepare_inputs`` --
-        after the graph key, too late for the key to see the synced value.
-        """
-        # enable_lm_head_tp_in_adp implies enable_attention_dp (asserted in
-        # Mapping.__init__), so ADP needs no separate check here.
-        if not (self.mapping.enable_lm_head_tp_in_adp
-                and spec_metadata.use_rejection_sampling):
-            return
-        local_flag = bool(spec_metadata.is_all_greedy_sample)
-        all_flags = self.dist.tp_allgather(local_flag, small_payload=True)
-        spec_metadata.group_all_greedy_sample = all(all_flags)
-        # Also overwrite the live flag directly: this iteration's scan already
-        # ran (update_is_all_greedy_sample just returned) and the CUDA graph
-        # key reads the flag next -- the stored override only takes effect on
-        # the NEXT rescan (populate), which is after key selection.
-        spec_metadata.is_all_greedy_sample = spec_metadata.group_all_greedy_sample
+        engine_metadata.sync_group_all_greedy_sample(spec_metadata,
+                                                     self.mapping, self.dist)
 
     def _set_spec_metadata_all_rank_num_tokens(
             self,
@@ -4345,24 +4239,9 @@ class PyTorchModelEngine(ModelEngine):
             spec_all_rank_num_tokens: List[int],
             all_rank_num_seqs: List[int],
             all_rank_num_gens: Optional[List[int]] = None) -> None:
-        # Eagle3 / MTP-eagle one-model use subseq_all_rank_num_tokens for
-        # draft loop iterations i>0 (per-sequence counts, since each
-        # sequence contributes one token per iteration).
-        spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
-        spec_metadata.all_rank_num_seqs = all_rank_num_seqs
-        # DSpark can draft only after the target processes the current bonus token,
-        # because it consumes captured target-layer hidden states for that token.
-        # Prefill computes hidden states for prompt tokens; the first generated token
-        # is sampled from the last prompt logits and has not itself passed through the
-        # target layers. Thus context requests seed the rolling window but do not run
-        # the draft. On mixed steps, num_seqs therefore over-counts the draft MoE
-        # workload; gen-only per-rank counts keep the FUSED_COMM (DeepGEMM MegaMoE)
-        # chunk loop identical across EP ranks.
-        if all_rank_num_gens is not None:
-            spec_metadata.all_rank_num_gens = all_rank_num_gens
-        if (spec_metadata.spec_dec_mode.is_mtp_eagle_one_model()
-                or spec_metadata.spec_dec_mode.is_eagle3_one_model()):
-            spec_metadata.subseq_all_rank_num_tokens = all_rank_num_seqs
+        engine_metadata.set_spec_metadata_all_rank_num_tokens(
+            spec_metadata, spec_all_rank_num_tokens, all_rank_num_seqs,
+            all_rank_num_gens)
 
     def _get_padding_params(
         self,
@@ -8168,44 +8047,11 @@ class PyTorchModelEngine(ModelEngine):
         sequence_lengths: List[int],
         request_ids: List[int],
     ):
-        """Build fresh, no-cache attention metadata for one packed encoder
-        batch. ``self.attn_metadata`` is not reused because that object is
-        bound to the decoder's KV-cache manager."""
-        if len(sequence_lengths) != len(request_ids):
-            raise ValueError("Encoder sequence lengths and request IDs must "
-                             "have the same length.")
-        sparse_metadata_params = (
-            self.sparse_attention_config.to_sparse_metadata_params(
-                pretrained_config=self.model.model_config.pretrained_config)
-            if self.sparse_attention_config is not None else None)
-        encoder_attn_metadata = self.attn_backend.Metadata(
-            max_num_requests=self.encoder_batch_size,
-            max_num_tokens=self.encoder_max_num_tokens,
-            max_num_sequences=self.encoder_batch_size * self.max_beam_width,
-            kv_cache_manager=None,
-            mapping=self.mapping,
-            runtime_features=self.attn_runtime_features,
-            enable_flash_mla=self.model.model_config.enable_flash_mla,
-            enable_context_mla_with_cached_kv=False,
-            cache_indirection=None,
-            sparse_metadata_params=sparse_metadata_params,
-            num_heads_per_kv=1,
-        )
-        assert isinstance(
-            encoder_attn_metadata,
-            (VanillaAttentionMetadata, TrtllmAttentionMetadata)
-        ), "Only vanilla and trtllm attention metadata are supported for the encoder pass"
-
-        encoder_attn_metadata.seq_lens = torch.tensor(
-            sequence_lengths,
-            dtype=torch.int,
-            pin_memory=prefer_pinned(),
-        )
-        encoder_attn_metadata.num_contexts = len(sequence_lengths)
-        encoder_attn_metadata.max_seq_len = self.max_seq_len
-        encoder_attn_metadata.request_ids = request_ids
-        encoder_attn_metadata.prepare_encoder_only()
-        return encoder_attn_metadata
+        return engine_metadata.make_encoder_attn_metadata(
+            self.model, sequence_lengths, request_ids, self.attn_backend,
+            self.attn_runtime_features, self.sparse_attention_config,
+            self.encoder_batch_size, self.encoder_max_num_tokens,
+            self.max_beam_width, self.max_seq_len, self.mapping)
 
     def _prepare_encoder_decoder_encoder_inputs(
         self,
