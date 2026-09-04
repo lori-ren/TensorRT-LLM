@@ -2398,18 +2398,22 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         PrefillCudaGraphBackend.BREAKABLE,
     ])
     def test_piecewise_and_breakable_use_identical_padding(self, backend):
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            PyTorchModelEngine
+        from tensorrt_llm._torch.pyexecutor.engine.runners import \
+            get_padding_params
 
-        engine = object.__new__(PyTorchModelEngine)
-        engine.enable_attention_dp = False
-        engine.prefill_cuda_graph_backend = backend
-        engine._prefill_cuda_graph_num_tokens = [128, 256, 512]
-        assert engine._get_padding_params(129, 1, None) == (256, True, None)
+        assert get_padding_params(
+            129,
+            1,
+            None,
+            dist=None,
+            enable_attention_dp=False,
+            prefill_cuda_graph_backend=backend,
+            prefill_cuda_graph_num_tokens=[128, 256, 512],
+        ) == (256, True, None)
 
     def test_attention_dp_prefill_graph_uses_all_rank_decision(self):
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            PyTorchModelEngine
+        from tensorrt_llm._torch.pyexecutor.engine.runners import \
+            get_padding_params
 
         class FakeDist:
 
@@ -2420,21 +2424,26 @@ class TestPiecewiseCudaGraphCaptureDefaults:
                 del value, small_payload
                 return self.decisions
 
-        engine = object.__new__(PyTorchModelEngine)
-        engine.enable_attention_dp = True
-        engine.prefill_cuda_graph_backend = PrefillCudaGraphBackend.BREAKABLE
-        engine._prefill_cuda_graph_num_tokens = [128, 256, 512]
-        engine._get_all_rank_ctx_requests = lambda _: [0, 1, 0, 0]
-
         all_rank_num_tokens = [1, 129, 1, 1]
-        engine.dist = FakeDist([True, True, True, True])
-        assert engine._get_padding_params(1, 0,
-                                          all_rank_num_tokens) == (256, True,
-                                                                   [256] * 4)
+        assert get_padding_params(
+            1,
+            0,
+            all_rank_num_tokens,
+            dist=FakeDist([True, True, True, True]),
+            enable_attention_dp=True,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            prefill_cuda_graph_num_tokens=[128, 256, 512],
+        ) == (256, True, [256] * 4)
 
-        engine.dist = FakeDist([True, False, True, True])
-        assert engine._get_padding_params(
-            1, 0, all_rank_num_tokens) == (1, False, all_rank_num_tokens)
+        assert get_padding_params(
+            1,
+            0,
+            all_rank_num_tokens,
+            dist=FakeDist([True, False, True, True]),
+            enable_attention_dp=True,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            prefill_cuda_graph_num_tokens=[128, 256, 512],
+        ) == (1, False, all_rank_num_tokens)
 
     def test_torch_compile_config_does_not_populate_legacy_capture_buckets(
             self):
