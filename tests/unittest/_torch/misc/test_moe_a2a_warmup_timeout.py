@@ -2,6 +2,9 @@ import unittest
 from unittest import mock
 
 from tensorrt_llm._torch.pyexecutor import model_engine
+from tensorrt_llm._torch.pyexecutor.engine.runners import common as runners_common
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import warmup as decoder_warmup
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.prepare import PrepareMixin
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 
 
@@ -14,12 +17,17 @@ class _WarmupFlagStub:
     stub exercises the real code path without either.
 
     The stub borrows the property objects without inheriting, so it has to
-    declare moe_load_balancer itself.
+    declare moe_load_balancer itself. is_warmup stays on the coordinator;
+    moe_load_balancer_iter_info moved to the decoder family.
     """
 
     is_warmup = PyTorchModelEngine.is_warmup
-    moe_load_balancer_iter_info = PyTorchModelEngine.moe_load_balancer_iter_info
+    moe_load_balancer_iter_info = PrepareMixin.moe_load_balancer_iter_info
     moe_load_balancer = None
+
+    def __init__(self):
+        # is_warmup writes the iter info through to the runner; this stub is both.
+        self._runner = self
 
 
 class TestMoeA2AWarmupBudget(unittest.TestCase):
@@ -32,21 +40,21 @@ class TestMoeA2AWarmupBudget(unittest.TestCase):
 
     def test_set_warmup_forwards_value_to_op(self):
         with mock.patch.object(
-            model_engine.torch.ops.trtllm, "moe_a2a_set_warmup", create=True
+            runners_common.torch.ops.trtllm, "moe_a2a_set_warmup", create=True
         ) as op:
-            model_engine._set_moe_a2a_warmup(True)
-            model_engine._set_moe_a2a_warmup(False)
+            runners_common._set_moe_a2a_warmup(True)
+            runners_common._set_moe_a2a_warmup(False)
         self.assertEqual([c.args[0] for c in op.call_args_list], [True, False])
 
     def test_missing_op_is_tolerated(self):
         """An older C++ build without the op must not break startup."""
         with mock.patch.object(
-            model_engine.torch.ops.trtllm,
+            runners_common.torch.ops.trtllm,
             "moe_a2a_set_warmup",
             create=True,
             side_effect=AttributeError("no such op"),
         ):
-            model_engine._set_moe_a2a_warmup(True)  # must not raise
+            runners_common._set_moe_a2a_warmup(True)  # must not raise
 
     def test_capture_context_selects_steady_state_then_restores(self):
         """CUDA graphs bake the budget in at capture time.
@@ -55,8 +63,8 @@ class TestMoeA2AWarmupBudget(unittest.TestCase):
         the kernel the steady-state budget and restore warmup afterwards.
         """
         seen = []
-        with mock.patch.object(model_engine, "_set_moe_a2a_warmup", side_effect=seen.append):
-            with model_engine._moe_a2a_steady_state_budget_for_capture():
+        with mock.patch.object(decoder_warmup, "_set_moe_a2a_warmup", side_effect=seen.append):
+            with decoder_warmup._moe_a2a_steady_state_budget_for_capture():
                 self.assertEqual(seen, [False])
             self.assertEqual(seen, [False, True])
 

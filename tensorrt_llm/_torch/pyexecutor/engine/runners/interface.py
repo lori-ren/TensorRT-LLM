@@ -68,6 +68,7 @@ class RunnerConfig:
 class RunnerDeps:
     """Engine-owned runtime collaborators shared by model runners."""
 
+    model: Any
     dist: Distributed | None
     mapping: Mapping
     input_ids_cuda: torch.Tensor

@@ -24,6 +24,8 @@ import tensorrt_llm
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import WarmupMixin
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
@@ -146,9 +148,15 @@ def _run_warmup_tracked(
 
     with (
         helix_ctx,
-        patch.object(model_engine, "_general_warmup", side_effect=tracker("general_warmup")),
-        patch.object(model_engine, "_run_autotuner_warmup", side_effect=tracker("autotuner")),
-        patch.object(model_engine, "_run_cuda_graph_warmup", side_effect=tracker("cuda_graph")),
+        patch.object(
+            model_engine._runner, "_general_warmup", side_effect=tracker("general_warmup")
+        ),
+        patch.object(
+            model_engine._runner, "_run_autotuner_warmup", side_effect=tracker("autotuner")
+        ),
+        patch.object(
+            model_engine._runner, "_run_cuda_graph_warmup", side_effect=tracker("cuda_graph")
+        ),
         patch("torch.cuda.empty_cache", side_effect=tracker("empty_cache")),
         patch(
             "tensorrt_llm._torch.custom_ops.torch_custom_ops.MoERunner.clear_all_workspaces",
@@ -188,7 +196,7 @@ class TestWarmupCleanup(unittest.TestCase):
     """Lock in warmup-cleanup behavior introduced by PR #14609 (Plan B)."""
 
     def test_no_kv_cache_warmup_delegates_runner_lifecycle(self):
-        model_engine = object.__new__(PyTorchModelEngine)
+        model_engine = object.__new__(DecoderRunner)
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
@@ -209,7 +217,7 @@ class TestWarmupCleanup(unittest.TestCase):
         warmup_sampling.assert_not_called()
 
     def test_no_kv_cache_warmup_rejects_allocated_kv_cache(self):
-        model_engine = object.__new__(PyTorchModelEngine)
+        model_engine = object.__new__(DecoderRunner)
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
@@ -227,7 +235,7 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertEqual(model_engine._runner.method_calls, [])
 
     def test_legacy_warmup_skips_without_kv_cache(self):
-        model_engine = object.__new__(PyTorchModelEngine)
+        model_engine = object.__new__(DecoderRunner)
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
         model_engine.enable_in_graph_sampling = False
@@ -250,7 +258,7 @@ class TestWarmupCleanup(unittest.TestCase):
         warmup_sampling.assert_called_once_with()
 
     def test_encoder_decoder_encoder_warmup_delegates_runner_lifecycle(self):
-        model_engine = object.__new__(PyTorchModelEngine)
+        model_engine = object.__new__(DecoderRunner)
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=True))
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
@@ -349,7 +357,7 @@ class TestWarmupCleanup(unittest.TestCase):
                     ]
                 ),
             )
-            PyTorchModelEngine._run_autotuner_warmup(engine, Mock())
+            WarmupMixin._run_autotuner_warmup(engine, Mock())
 
         self.assertEqual(calls, [])
         self.assertEqual(method.backend, "trtllm")
@@ -452,7 +460,7 @@ class TestWarmupCleanup(unittest.TestCase):
                 patch("torch.cuda.empty_cache"),
                 patch("tensorrt_llm._torch.pyexecutor.model_engine.clear_memory_buffers"),
             ):
-                PyTorchModelEngine._run_autotuner_warmup(engine, resource_manager)
+                WarmupMixin._run_autotuner_warmup(engine, resource_manager)
 
         self.assertEqual(
             calls,
@@ -564,7 +572,7 @@ class TestWarmupCleanup(unittest.TestCase):
                 patch("torch.cuda.empty_cache"),
                 patch("tensorrt_llm._torch.pyexecutor.model_engine.clear_memory_buffers"),
             ):
-                PyTorchModelEngine._run_autotuner_warmup(engine, resource_manager)
+                WarmupMixin._run_autotuner_warmup(engine, resource_manager)
 
         self.assertEqual(
             calls,
@@ -656,7 +664,7 @@ class TestWarmupCleanup(unittest.TestCase):
                 patch("torch.cuda.empty_cache"),
                 patch("tensorrt_llm._torch.pyexecutor.model_engine.clear_memory_buffers"),
             ):
-                PyTorchModelEngine._run_autotuner_warmup(engine, resource_manager)
+                WarmupMixin._run_autotuner_warmup(engine, resource_manager)
 
         dist.tp_allgather.assert_called_once_with(1)
         dist.pp_allgather.assert_called_once_with([1, 1])
@@ -683,7 +691,7 @@ class TestWarmupCleanup(unittest.TestCase):
                 model=SimpleNamespace(modules=lambda: [SimpleNamespace(quant_method=method)]),
             )
 
-            PyTorchModelEngine._run_autotuner_warmup(engine, Mock())
+            WarmupMixin._run_autotuner_warmup(engine, Mock())
 
         self.assertFalse(method.use_native_autotuner)
         self.assertFalse(method.needs_native_autotune)

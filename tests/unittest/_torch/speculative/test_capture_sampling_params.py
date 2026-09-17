@@ -25,8 +25,10 @@ import unittest
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import (
+    NON_GREEDY_CAPTURE_SAMPLING_PARAMS,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.model_engine import NON_GREEDY_CAPTURE_SAMPLING_PARAMS
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig

@@ -19,6 +19,21 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 
+def _set_moe_a2a_warmup(in_warmup: bool) -> None:
+    """Select the MoE all-to-all completion-flag budget for the current phase.
+
+    No-op when the op is unavailable (older bindings).
+    """
+    try:
+        torch.ops.trtllm.moe_a2a_set_warmup(in_warmup)
+        logger.info(f"moe_a2a completion-flag budget: in_warmup={in_warmup}")
+    except (AttributeError, RuntimeError) as e:
+        logger.warning(
+            f"moe_a2a_set_warmup unavailable, the all-to-all timeout "
+            f"budget was not switched: {type(e).__name__}: {e}"
+        )
+
+
 def get_all_rank_num_tokens(
     attn_metadata: AttentionMetadata,
     *,

@@ -65,7 +65,7 @@ class EncoderConfigMixin:
     fixed_seq_len: int | None = None
 
     @classmethod
-    def create(
+    def encoder_fields(
         cls,
         *,
         model: nn.Module,
@@ -81,8 +81,13 @@ class EncoderConfigMixin:
         enable_autotuner: bool,
         is_encoder_decoder: bool,
         draft_model: bool,
-    ) -> Self:
-        """Resolve encoder settings and construct the concrete runner config."""
+    ) -> dict:
+        """Resolve the encoder settings this mixin contributes.
+
+        Separate from ``create`` so a config that composes another mixin can
+        add that mixin's fields before construction, without this one knowing
+        anything about it.
+        """
         batch_sizes = list(graph_config.batch_sizes or []) if graph_config is not None else []
         num_tokens = list(graph_config.num_tokens or []) if graph_config is not None else []
         seq_lens = list(graph_config.seq_lens or []) if graph_config is not None else []
@@ -177,7 +182,7 @@ class EncoderConfigMixin:
             if feature_shape is not None
             else (filtered_num_tokens[-1] if filtered_num_tokens else 0)
         )
-        return cls(
+        return dict(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
             max_seq_len=max_seq_len,
@@ -228,20 +233,22 @@ class EncoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
         enable_autotuner: bool,
         draft_model: bool,
     ) -> Self:
-        return super().create(
-            model=model,
-            mapping=mapping,
-            graph_config=graph_config,
-            max_batch_size=max_batch_size,
-            max_num_tokens=max_num_tokens,
-            max_seq_len=max_seq_len,
-            max_beam_width=max_beam_width,
-            without_logits=without_logits,
-            attention_backend=attention_backend,
-            attention_runtime_features=attention_runtime_features,
-            enable_autotuner=enable_autotuner,
-            is_encoder_decoder=False,
-            draft_model=draft_model,
+        return cls(
+            **cls.encoder_fields(
+                model=model,
+                mapping=mapping,
+                graph_config=graph_config,
+                max_batch_size=max_batch_size,
+                max_num_tokens=max_num_tokens,
+                max_seq_len=max_seq_len,
+                max_beam_width=max_beam_width,
+                without_logits=without_logits,
+                attention_backend=attention_backend,
+                attention_runtime_features=attention_runtime_features,
+                enable_autotuner=enable_autotuner,
+                is_encoder_decoder=False,
+                draft_model=draft_model,
+            )
         )
 
 

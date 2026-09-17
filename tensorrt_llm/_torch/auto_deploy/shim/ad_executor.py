@@ -27,10 +27,11 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
 )
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.forward import ForwardMixin
 from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
-from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decoding_config
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -537,12 +538,12 @@ class ADEngine(ModelEngine):
         # keep a reference for one dummy request around
         self.padding_dummy_request: Optional[LlmRequest] = None
 
-        # Reuse _execute_logit_post_processors from PyTorchModelEngine
+        # Reuse _execute_logit_post_processors from the decoder family
         self.dist_config = dist_config
         self.mapping = mapping
         self.dist = dist
         self._execute_logit_post_processors = types.MethodType(
-            PyTorchModelEngine._execute_logit_post_processors, self
+            ForwardMixin._execute_logit_post_processors, self
         )
 
     def _release_cuda_graphs(self) -> None:

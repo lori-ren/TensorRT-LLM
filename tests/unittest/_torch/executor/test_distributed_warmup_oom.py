@@ -12,6 +12,7 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor import model_engine as model_engine_module
 from tensorrt_llm._torch.pyexecutor import py_executor as py_executor_module
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 
 
@@ -45,7 +46,7 @@ def _engine(
     ``peer_values`` defaults to peers that mirror this rank, i.e. a world that
     agrees with whatever this rank reports.
     """
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(DecoderRunner)
 
     def _allgather(value):
         peers = [value] * (world_size - 1) if peer_values is None else list(peer_values)
