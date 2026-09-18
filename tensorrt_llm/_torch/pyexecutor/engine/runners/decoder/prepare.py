@@ -62,8 +62,9 @@ class InputPreparer:
 
     def __init__(self, ctx: DecoderContext) -> None:
         self._ctx = ctx
-
-    """Input preparation for the decoder family."""
+        self._steady_gen_cache = None
+        self._previous_request_ids: list[int] = []
+        self._encoder_decoder_staged_request_ids = None
 
     @nvtx_range("_prepare_inputs")
     def _prepare_inputs(
@@ -167,8 +168,8 @@ class InputPreparer:
                 )  # [batch, draft_len]
 
         # Must be before the update of py_batch_idx
-        if self._ctx.state.guided_decoder is not None:
-            self._ctx.state.guided_decoder.add_batch(
+        if self._ctx.guided_decoder is not None:
+            self._ctx.guided_decoder.add_batch(
                 scheduled_requests,
                 new_tokens=new_tokens_device,
                 runtime_draft_len=self._ctx.state.runtime_draft_len,
@@ -189,7 +190,7 @@ class InputPreparer:
                 resource_manager,
             )
 
-        self._ctx.state.encoder_decoder_staged_request_ids = None
+        self._encoder_decoder_staged_request_ids = None
         if not promoted_context_request_ids and self._can_use_steady_gen_fast_prepare(
             scheduled_requests, new_tokens_device, next_draft_tokens_device, spec_metadata
         ):
@@ -198,7 +199,7 @@ class InputPreparer:
             )
         # Any full pass invalidates the steady-state cache; it is re-recorded
         # at the end of this pass when the batch qualifies.
-        self._ctx.state.steady_gen_cache = None
+        self._steady_gen_cache = None
 
         # Hoist use_mrope to a function-scope local so the per-request /
         # per-context-request mrope branches use LOAD_FAST instead of LOAD_ATTR.
@@ -232,7 +233,7 @@ class InputPreparer:
         # the write path only ever targets real ``py_seq_slot``s, so this slot
         # permanently reads back a zero delta.
         mrope_dummy_seq_slot = (
-            self._ctx.config.decoder_max_num_tokens * self._ctx.deps.mapping.pp_size
+            self._ctx.runner_config.max_num_tokens * self._ctx.deps.mapping.pp_size
         )
         num_accepted_draft_tokens = []  # per request
         is_enc_dec = self._ctx.is_encoder_decoder
@@ -504,7 +505,7 @@ class InputPreparer:
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
-        runtime_tokens_per_gen_step = self._ctx.get_runtime_tokens_per_gen_step(
+        runtime_tokens_per_gen_step = self._ctx.deps.spec.runtime_tokens_per_gen_step(
             self._ctx.state.runtime_draft_len
         )
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
@@ -544,7 +545,9 @@ class InputPreparer:
                 draft_lens.append(num_draft_tokens)
                 if (
                     self._ctx.state.enable_spec_decode
-                    and spec_config.spec_dec_mode.extend_ctx(self._ctx.config.attention_backend)
+                    and spec_config.spec_dec_mode.extend_ctx(
+                        self._ctx.runner_config.attention_backend
+                    )
                     and spec_config.is_linear_tree
                 ):
                     # We're treating the prompt lengths as context requests here, so
@@ -599,7 +602,9 @@ class InputPreparer:
                 request.cached_tokens = past_seen_token_num + runtime_tokens_per_gen_step
                 if (
                     self._ctx.state.enable_spec_decode
-                    and spec_config.spec_dec_mode.extend_ctx(self._ctx.config.attention_backend)
+                    and spec_config.spec_dec_mode.extend_ctx(
+                        self._ctx.runner_config.attention_backend
+                    )
                     and spec_config.is_linear_tree
                 ):
                     prompt_lengths.append(runtime_tokens_per_gen_step)
@@ -900,7 +905,7 @@ class InputPreparer:
         num_tokens = len(input_ids)
         num_draft_tokens = len(draft_tokens)
         total_num_tokens = len(position_ids)
-        max_num_tokens = self._ctx.config.decoder_max_num_tokens
+        max_num_tokens = self._ctx.runner_config.max_num_tokens
         assert total_num_tokens <= max_num_tokens, (
             f"total_num_tokens ({total_num_tokens}) should be less than or "
             f"equal to max_num_tokens ({max_num_tokens})"
@@ -992,7 +997,7 @@ class InputPreparer:
             self._ctx.buffers.draft_tokens_cuda[: len(draft_tokens)].copy_(
                 draft_tokens, non_blocking=True
             )
-        if self._ctx.config.is_spec_decode and len(num_accepted_draft_tokens) > 0:
+        if self._ctx.config.spec_config is not None and len(num_accepted_draft_tokens) > 0:
             num_accepted_draft_tokens = torch.tensor(
                 num_accepted_draft_tokens, dtype=torch.int, pin_memory=prefer_pinned()
             )
@@ -1032,7 +1037,7 @@ class InputPreparer:
             # Initialize these two values to zeros
             self._ctx.buffers.previous_pos_id_offsets_cuda *= 0
             self._ctx.buffers.previous_kv_lens_offsets_cuda *= 0
-            runtime_tokens_per_gen_step = self._ctx.get_runtime_tokens_per_gen_step(
+            runtime_tokens_per_gen_step = self._ctx.deps.spec.runtime_tokens_per_gen_step(
                 self._ctx.state.runtime_draft_len
             )
             runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
@@ -1107,10 +1112,11 @@ class InputPreparer:
             seq_slots_device = previous_seq_slots_device()
             max_draft_len = max(draft_lens)
             new_tokens = new_tokens_device[
-                : max_draft_len + 1, seq_slots_device, : self._ctx.config.max_beam_width
+                : max_draft_len + 1, seq_slots_device, : self._ctx.runner_config.max_beam_width
             ]
             self._ctx.buffers.input_ids_cuda[
-                num_tokens : num_tokens + previous_batch_len * self._ctx.config.max_beam_width
+                num_tokens : num_tokens
+                + previous_batch_len * self._ctx.runner_config.max_beam_width
             ].copy_(new_tokens.flatten(), non_blocking=True)
 
         if (
@@ -1238,7 +1244,7 @@ class InputPreparer:
                     cache_indirection_buffer[gen_request_seq_slots_tensor]
                 )
             if cache_indirection_buffer is not None or self._ctx.is_warmup:
-                attn_metadata.beam_width = self._ctx.config.max_beam_width
+                attn_metadata.beam_width = self._ctx.runner_config.max_beam_width
         else:
             attn_metadata.beam_width = 1
 
@@ -1250,7 +1256,7 @@ class InputPreparer:
         attn_metadata.num_chunked_ctx_requests = 0
         if (
             self._ctx.state.enable_spec_decode
-            and spec_config.spec_dec_mode.extend_ctx(self._ctx.config.attention_backend)
+            and spec_config.spec_dec_mode.extend_ctx(self._ctx.runner_config.attention_backend)
             and spec_config.is_linear_tree
         ):
             # For the tree decoding, we want to use XQA to process the draft tokens for the target model.
@@ -1294,7 +1300,7 @@ class InputPreparer:
         peft_cache_manager = resource_manager and resource_manager.get_resource_manager(
             ResourceManagerType.PEFT_CACHE_MANAGER
         )
-        lora_params = self._ctx.config.lora.build(
+        lora_params = self._ctx.deps.lora.build(
             scheduled_requests,
             attn_metadata,
             cuda_graph_lora_manager=self._ctx.state.cuda_graph_lora_manager,
@@ -1441,14 +1447,14 @@ class InputPreparer:
             + sum(draft_lens)
             + len(first_draft_requests)
         )
-        self._ctx.state.iter_states["num_ctx_requests"] = num_ctx_requests
-        self._ctx.state.iter_states["num_ctx_tokens"] = num_ctx_tokens
-        self._ctx.state.iter_states["num_generation_tokens"] = num_generation_tokens
+        self._ctx.iter_states["num_ctx_requests"] = num_ctx_requests
+        self._ctx.iter_states["num_ctx_tokens"] = num_ctx_tokens
+        self._ctx.iter_states["num_generation_tokens"] = num_generation_tokens
         # Count the already-cached prefix for the sequences scheduled this iteration.
-        self._ctx.state.iter_states["cached_kv_tokens"] = sum(num_cached_tokens_per_seq)
+        self._ctx.iter_states["cached_kv_tokens"] = sum(num_cached_tokens_per_seq)
 
         if not self._ctx.is_warmup:
-            self._ctx.state.previous_request_ids = all_gen_request_ids
+            self._previous_request_ids = all_gen_request_ids
 
             # Record the steady-state generation cache when this pass handled
             # purely non-dummy generation requests that all carried a previous
@@ -1468,13 +1474,13 @@ class InputPreparer:
                 and not self._ctx.config.is_draft_model
                 and spec_metadata is None
                 and new_tokens_device is not None
-                and self._ctx.state.guided_decoder is None
+                and self._ctx.guided_decoder is None
                 and not self._ctx.config.enable_attention_dp
                 and not mrope_position_ids
                 and not mrope_delta_write_seq_slots
                 and not mrope_delta_read_seq_slots
                 and not self._ctx.use_beam_search
-                and self._ctx.config.max_beam_width == 1
+                and self._ctx.runner_config.max_beam_width == 1
                 and not is_enc_dec
                 and not _has_cp_helix
                 and num_ctx_requests == 0
@@ -1493,7 +1499,7 @@ class InputPreparer:
                 self._ctx.config.steady_gen_positions_pinned[:_n_gen].copy_(
                     torch.as_tensor(num_cached_tokens_snapshot, dtype=torch.int)
                 )
-                self._ctx.state.steady_gen_cache = {
+                self._steady_gen_cache = {
                     "num_requests": _n_gen,
                     "request_ids": all_gen_request_ids,
                     "prompt_lens": prompt_lengths,
@@ -1560,14 +1566,14 @@ class InputPreparer:
                     inputs["attn_metadata"].apply_spec_decode_kv_lens_offsets(
                         self._ctx.buffers.previous_kv_lens_offsets_cuda,
                         num_gen_requests,
-                        self._ctx.get_runtime_tokens_per_gen_step(
+                        self._ctx.deps.spec.runtime_tokens_per_gen_step(
                             self._ctx.state.runtime_draft_len
                         ),
                         num_chunked_contexts=num_chunked_ctx_requests,
                     )
 
-        if self._ctx.state.guided_decoder is not None:
-            self._ctx.state.guided_decoder.token_event.record()
+        if self._ctx.guided_decoder is not None:
+            self._ctx.guided_decoder.token_event.record()
 
         return inputs
 
@@ -1615,7 +1621,7 @@ class InputPreparer:
                     inputs["attn_metadata"].apply_spec_decode_kv_lens_offsets(
                         self._ctx.buffers.previous_kv_lens_offsets_cuda,
                         num_gen_requests,
-                        self._ctx.get_runtime_tokens_per_gen_step(
+                        self._ctx.deps.spec.runtime_tokens_per_gen_step(
                             self._ctx.state.runtime_draft_len
                         ),
                         num_chunked_contexts=num_chunked_ctx_requests,
@@ -1640,7 +1646,7 @@ class InputPreparer:
         for batches with no actual mrope work) the (3,1,N) broadcast buffer
         the model reads is the one advanced.
         """
-        cache = self._ctx.state.steady_gen_cache
+        cache = self._steady_gen_cache
         num_requests = cache["num_requests"]
 
         # Positions and cached-token counts are the same values in this
@@ -1672,12 +1678,12 @@ class InputPreparer:
         # are unchanged since the last full pass.
         previous_slots = self._ctx.buffers.previous_batch_indices_cuda[:num_requests]
         torch.index_select(
-            new_tensors_device.new_tokens[0, :, : self._ctx.config.max_beam_width],
+            new_tensors_device.new_tokens[0, :, : self._ctx.runner_config.max_beam_width],
             0,
             previous_slots,
             out=self._ctx.buffers.input_ids_cuda[
-                : num_requests * self._ctx.config.max_beam_width
-            ].view(num_requests, self._ctx.config.max_beam_width),
+                : num_requests * self._ctx.runner_config.max_beam_width
+            ].view(num_requests, self._ctx.runner_config.max_beam_width),
         )
 
         if not attn_metadata.is_cuda_graph:
@@ -1734,10 +1740,10 @@ class InputPreparer:
                 self._ctx.buffers.position_ids_cuda[num_requests:padded_num_tokens].fill_(0)
             virtual_num_tokens = padded_num_tokens
 
-        self._ctx.state.iter_states["num_ctx_requests"] = 0
-        self._ctx.state.iter_states["num_ctx_tokens"] = 0
-        self._ctx.state.iter_states["num_generation_tokens"] = num_requests
-        self._ctx.state.iter_states["cached_kv_tokens"] = sum(num_cached_tokens_per_seq)
+        self._ctx.iter_states["num_ctx_requests"] = 0
+        self._ctx.iter_states["num_ctx_tokens"] = 0
+        self._ctx.iter_states["num_generation_tokens"] = num_requests
+        self._ctx.iter_states["cached_kv_tokens"] = sum(num_cached_tokens_per_seq)
 
         if use_mrope:
             final_position_ids = self._ctx.buffers.mrope_position_ids_cuda[
@@ -1772,7 +1778,7 @@ class InputPreparer:
         per-step check only needs to confirm the dynamic conditions: still a
         generation-only batch with the exact same requests in the same order.
         """
-        cache = self._ctx.state.steady_gen_cache
+        cache = self._steady_gen_cache
         if cache is None or self._ctx.is_warmup:
             return False
         if (

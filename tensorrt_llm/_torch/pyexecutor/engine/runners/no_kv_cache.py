@@ -16,15 +16,15 @@ from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetad
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancerIterContext
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.speculative import SpecMetadata, get_spec_metadata
+from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._torch.utils import set_per_request_prefill_cuda_graph_flag
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, PrefillCudaGraphBackend
+from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 
-from ..metadata import build_attention_metadata, update_spec_metadata
+from ..metadata import build_attention_metadata
 from .common import (
     apply_position_id_offset,
     get_all_rank_num_tokens,
@@ -44,12 +44,6 @@ class NoKVCacheRunnerConfig(RunnerConfig):
     prefill_cuda_graph_backend: PrefillCudaGraphBackend
     prefill_cuda_graph_num_tokens: list[int]
     mm_encoder_cache_enabled: bool
-    spec_config: DecodingBaseConfig | None
-    is_draft_model: bool
-    num_seq_slots: int | None
-    original_max_draft_len: int
-    original_max_total_draft_tokens: int
-    spec_dec_max_total_draft_tokens: int
 
 
 class NoKVCacheRunner(ABC):
@@ -92,40 +86,19 @@ class NoKVCacheRunner(ABC):
         attn_metadata: AttentionMetadata,
         runtime_draft_len: int,
     ) -> SpecMetadata | None:
-        runner_config = self._config
-        spec_config = runner_config.spec_config
-        if spec_config is None:
+        spec = self._deps.spec
+        if not spec.enabled:
             return None
 
-        spec_resource_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.SPEC_RESOURCE_MANAGER
-        )
-        spec_tree_manager = getattr(spec_resource_manager, "spec_tree_manager", None)
-        spec_metadata = get_spec_metadata(
-            spec_config,
-            self._model.config,
-            runner_config.max_batch_size,
-            max_num_tokens=runner_config.max_num_tokens,
-            spec_resource_manager=spec_resource_manager,
-            is_draft_model=runner_config.is_draft_model,
-            max_seq_len=runner_config.max_seq_len,
-            num_seq_slots=runner_config.num_seq_slots,
-        )
+        spec_resource_manager, spec_tree_manager = spec.resource_managers(resource_manager)
+        spec_metadata = spec.build(spec_resource_manager)
         assert spec_metadata is not None
-        update_spec_metadata(
+        spec.update(
             spec_metadata,
             scheduled_requests,
             attn_metadata,
             spec_tree_manager=spec_tree_manager,
             runtime_draft_len=runtime_draft_len,
-            runtime_tokens_per_gen_step=spec_config.get_runtime_tokens_per_gen_step(
-                runtime_draft_len
-            ),
-            is_draft_model=runner_config.is_draft_model,
-            attention_backend=runner_config.attention_backend,
-            original_max_draft_len=runner_config.original_max_draft_len,
-            original_max_total_draft_tokens=(runner_config.original_max_total_draft_tokens),
-            spec_dec_max_total_draft_tokens=(runner_config.spec_dec_max_total_draft_tokens),
         )
         return spec_metadata
 
@@ -145,7 +118,7 @@ class NoKVCacheRunner(ABC):
             attn_metadata,
             runtime_draft_len,
         )
-        enable_spec_decode = runner_config.spec_config is not None
+        enable_spec_decode = self._deps.spec.enabled
 
         sequence_lengths = []
         input_ids = []

@@ -11,11 +11,11 @@ phase through the factories below.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, Tuple, cast
 
-from ..interface import RunnerDeps
+from ..interface import RunnerConfig, RunnerDeps
 from .buffers import DecoderBuffers
-from .config import DecoderRunnerConfig
+from .config import DecoderConfigMixin
 from .context import DecoderContext
 from .forward import ForwardExecutor
 from .prepare import InputPreparer
@@ -30,29 +30,94 @@ class DecoderMixin:
         self,
         model: Any,
         deps: RunnerDeps,
-        config: DecoderRunnerConfig,
+        config: DecoderConfigMixin,
         buffers: DecoderBuffers,
         *,
         warmup_flag: Callable[[], bool],
     ) -> None:
         self._ctx = DecoderContext(
             config=config,
+            runner_config=cast(RunnerConfig, config),
             deps=deps,
             buffers=buffers,
             state=DecoderState(
-                enable_spec_decode=config.is_spec_decode,
+                enable_spec_decode=config.spec_config is not None,
                 runtime_draft_len=config.initial_runtime_draft_len,
-                get_runtime_tokens_per_gen_step=(
-                    config.spec_config.get_runtime_tokens_per_gen_step
-                    if config.spec_config is not None
-                    else lambda runtime_draft_len: 1
-                ),
             ),
             warmup_flag=warmup_flag,
         )
         self._preparer = self._make_preparer()
         self._executor = self._make_executor(self._preparer)
         self._warmup = self._make_warmup(self._preparer, self._executor)
+
+    # ---- what the coordinator installs; each phase gets its own handle ----
+    @property
+    def cuda_graph_runner(self):
+        return self._ctx.cuda_graph_runner
+
+    @cuda_graph_runner.setter
+    def cuda_graph_runner(self, value) -> None:
+        self._ctx.cuda_graph_runner = value
+
+    @property
+    def breakable_cuda_graph_runner(self):
+        return self._ctx.breakable_cuda_graph_runner
+
+    @breakable_cuda_graph_runner.setter
+    def breakable_cuda_graph_runner(self, value) -> None:
+        self._ctx.breakable_cuda_graph_runner = value
+
+    @property
+    def guided_decoder(self):
+        return self._ctx.guided_decoder
+
+    @guided_decoder.setter
+    def guided_decoder(self, value) -> None:
+        self._ctx.guided_decoder = value
+
+    @property
+    def forward_pass_callable(self):
+        return self._executor.forward_pass_callable
+
+    @forward_pass_callable.setter
+    def forward_pass_callable(self, value) -> None:
+        self._executor.forward_pass_callable = value
+
+    @property
+    def sample_in_graph_callable(self):
+        return self._executor.sample_in_graph_callable
+
+    @sample_in_graph_callable.setter
+    def sample_in_graph_callable(self, value) -> None:
+        self._executor.sample_in_graph_callable = value
+
+    @property
+    def stage_in_graph_sampling(self):
+        return self._executor.stage_in_graph_sampling
+
+    @stage_in_graph_sampling.setter
+    def stage_in_graph_sampling(self, value) -> None:
+        self._executor.stage_in_graph_sampling = value
+
+    @property
+    def attn_metadata(self):
+        return self._ctx.attn_metadata
+
+    @attn_metadata.setter
+    def attn_metadata(self, value) -> None:
+        self._ctx.attn_metadata = value
+
+    @property
+    def spec_metadata(self):
+        return self._ctx.spec_metadata
+
+    @spec_metadata.setter
+    def spec_metadata(self, value) -> None:
+        self._ctx.spec_metadata = value
+
+    @property
+    def iter_states(self) -> dict:
+        return self._ctx.iter_states
 
     def _make_preparer(self) -> InputPreparer:
         return InputPreparer(self._ctx)
@@ -97,22 +162,23 @@ class DecoderMixin:
         self._warmup.capture_graphs(resource_manager)
 
     def cleanup(self) -> None:
-        state = self._ctx.state
-        state.attn_metadata = None
-        state.spec_metadata = None
-        state.steady_gen_cache = None
-        state.encoder_decoder_host_buffer_pool.clear()
+        self._ctx.attn_metadata = None
+        self._ctx.spec_metadata = None
+        self._preparer._steady_gen_cache = None
+        pool = getattr(self._preparer, "_encoder_decoder_host_buffer_pool", None)
+        if pool is not None:
+            pool.clear()
 
     @property
     def moe_load_balancer_iter_info(self):
-        moe_load_balancer = self._ctx.config.moe_load_balancer
+        moe_load_balancer = self._ctx.deps.moe_load_balancer
         if moe_load_balancer is not None:
             return moe_load_balancer.enable_statistic, moe_load_balancer.enable_update_weights
         return False, False
 
     @moe_load_balancer_iter_info.setter
     def moe_load_balancer_iter_info(self, value: Tuple[bool, bool]):
-        moe_load_balancer = self._ctx.config.moe_load_balancer
+        moe_load_balancer = self._ctx.deps.moe_load_balancer
         if moe_load_balancer is not None:
             moe_load_balancer.set_iter_info(
                 enable_statistic=value[0], enable_update_weights=value[1]

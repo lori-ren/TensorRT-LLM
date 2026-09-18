@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-import dataclasses
+import weakref
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -13,12 +13,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch
 from torch import nn
-from typing_extensions import Self
 
-from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionBackend,
-    AttentionRuntimeFeatures,
-)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
 from tensorrt_llm._torch.memory_buffer_utils import with_shared_pool
@@ -28,9 +23,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.internal import batch_manager as batch_manager_bindings
-from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 
 from ....attention.backends.interface import AttentionMetadata
 from ....metadata import KVCacheParams
@@ -47,7 +40,8 @@ from .common import (
     get_top_level_model,
 )
 from .decoder import DecoderBuffers, DecoderMixin
-from .decoder.config import DecoderConfigMixin, DecoderRunnerConfig
+from .decoder.config import DecoderConfigMixin
+from .decoder.context import DecoderContext
 from .decoder.forward import ForwardExecutor
 from .decoder.prepare import InputPreparer
 from .decoder.warmup import WarmupDriver
@@ -57,61 +51,24 @@ from .interface import RunnerConfig, RunnerDeps
 
 @dataclass(frozen=True, kw_only=True)
 class EncoderDecoderRunnerConfig(EncoderConfigMixin, DecoderConfigMixin, RunnerConfig):
-    """Configuration for the Encoder-Decoder model runner.
+    """Both halves beside one runner contract.
 
-    Both halves: ``EncoderConfigMixin`` for the encoder phase,
-    ``DecoderConfigMixin`` because the decoder half is the decoder family's.
+    Each half is handed this object under its own mixin, so neither names a
+    leaf the other composition does not have. Build it from ``encoder_fields``
+    beside the decoder settings -- neither half's factory knows about the other.
     """
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        decoder: "DecoderRunnerConfig",
-        model: nn.Module,
-        mapping: Mapping,
-        graph_config: EncodeCudaGraphConfig | None,
-        max_batch_size: int,
-        max_num_tokens: int,
-        max_seq_len: int,
-        max_beam_width: int,
-        without_logits: bool,
-        attention_backend: type[AttentionBackend],
-        attention_runtime_features: AttentionRuntimeFeatures,
-        enable_autotuner: bool,
-        draft_model: bool,
-    ) -> Self:
-        """Compose both halves.
-
-        The encoder arguments size the encoder phase; ``decoder`` carries the
-        decoder half's settings verbatim, so neither mixin has to know that the
-        other exists.
-        """
-        return cls(
-            **cls.encoder_fields(
-                model=model,
-                mapping=mapping,
-                graph_config=graph_config,
-                max_batch_size=max_batch_size,
-                max_num_tokens=max_num_tokens,
-                max_seq_len=max_seq_len,
-                max_beam_width=max_beam_width,
-                without_logits=without_logits,
-                attention_backend=attention_backend,
-                attention_runtime_features=attention_runtime_features,
-                enable_autotuner=enable_autotuner,
-                is_encoder_decoder=True,
-                draft_model=draft_model,
-            ),
-            **{
-                field.name: getattr(decoder, field.name)
-                for field in dataclasses.fields(DecoderConfigMixin)
-            },
-        )
 
 
 class EncoderDecoderInputPreparer(InputPreparer):
     """Input preparation for encoder-decoder: it adds cross attention."""
+
+    def __init__(self, ctx: DecoderContext) -> None:
+        super().__init__(ctx)
+        self._encoder_decoder_host_buffer_pool: list[dict] = []
+        self._cross_attn_stable_cached_tokens = None
+        self._cross_attn_stable_request_ids = None
+        self._encoder_decoder_position_id_offset = None
+        self._encoder_decoder_input_fast_path_static_eligible = None
 
     def _can_use_input_fast_path(
         self,
@@ -120,30 +77,30 @@ class EncoderDecoderInputPreparer(InputPreparer):
         next_draft_tokens_device: Optional[torch.Tensor],
     ) -> bool:
         """Return whether the TRT-like persistent input path is sufficient."""
-        static_eligible = self._ctx.state.encoder_decoder_input_fast_path_static_eligible
+        static_eligible = self._encoder_decoder_input_fast_path_static_eligible
         if static_eligible is None:
             static_eligible = (
                 hasattr(batch_manager_bindings, "prepare_encoder_decoder_inputs")
                 and self._ctx.is_encoder_decoder
                 and not self._ctx.config.is_draft_model
-                and self._ctx.config.max_beam_width == 1
+                and self._ctx.runner_config.max_beam_width == 1
                 and self._ctx.config.sparse_attention_config is None
                 and not self._ctx.use_mrope
                 and not self._ctx.config.enable_attention_dp
                 and not self._ctx.deps.mapping.has_cp_helix()
                 and not self.is_multimodal
-                and not self._ctx.config.attention_runtime_features.chunked_prefill
-                and not self._ctx.config.attention_runtime_features.cache_reuse
-                and not self._ctx.config.attention_runtime_features.has_speculative_draft_tokens
+                and not self._ctx.runner_config.attention_runtime_features.chunked_prefill
+                and not self._ctx.runner_config.attention_runtime_features.cache_reuse
+                and not self._ctx.runner_config.attention_runtime_features.has_speculative_draft_tokens
             )
-            self._ctx.state.encoder_decoder_input_fast_path_static_eligible = static_eligible
+            self._encoder_decoder_input_fast_path_static_eligible = static_eligible
         if (
             not static_eligible
             or self._ctx.state.enable_spec_decode
             or self._ctx.config.lora_model_config is not None
             or new_tokens_device is None
             or next_draft_tokens_device is not None
-            or self._ctx.state.guided_decoder is not None
+            or self._ctx.guided_decoder is not None
         ):
             return False
 
@@ -156,7 +113,7 @@ class EncoderDecoderInputPreparer(InputPreparer):
 
     def _acquire_encoder_decoder_host_buffers(self) -> Dict[str, Any]:
         """Acquire pinned staging whose preceding asynchronous copies finished."""
-        pool = self._ctx.state.encoder_decoder_host_buffer_pool
+        pool = self._encoder_decoder_host_buffer_pool
         for buffers in pool:
             event = buffers["event"]
             if event is None or event.query():
@@ -164,28 +121,28 @@ class EncoderDecoderInputPreparer(InputPreparer):
 
         buffers = {
             "input_ids": torch.empty(
-                self._ctx.config.decoder_max_num_tokens, dtype=torch.int, pin_memory=prefer_pinned()
+                self._ctx.runner_config.max_num_tokens, dtype=torch.int, pin_memory=prefer_pinned()
             ),
             "position_ids": torch.empty(
-                self._ctx.config.decoder_max_num_tokens, dtype=torch.int, pin_memory=prefer_pinned()
+                self._ctx.runner_config.max_num_tokens, dtype=torch.int, pin_memory=prefer_pinned()
             ),
             "sequence_lengths": torch.empty(
-                self._ctx.config.batch_size, dtype=torch.int, pin_memory=prefer_pinned()
+                self._ctx.runner_config.max_batch_size, dtype=torch.int, pin_memory=prefer_pinned()
             ),
             "prompt_lengths": torch.empty(
-                self._ctx.config.batch_size, dtype=torch.int, pin_memory=prefer_pinned()
+                self._ctx.runner_config.max_batch_size, dtype=torch.int, pin_memory=prefer_pinned()
             ),
             "cached_token_lengths": torch.empty(
-                self._ctx.config.batch_size, dtype=torch.int, pin_memory=prefer_pinned()
+                self._ctx.runner_config.max_batch_size, dtype=torch.int, pin_memory=prefer_pinned()
             ),
             "kv_lengths": torch.empty(
-                self._ctx.config.batch_size, dtype=torch.int, pin_memory=prefer_pinned()
+                self._ctx.runner_config.max_batch_size, dtype=torch.int, pin_memory=prefer_pinned()
             ),
             "encoder_kv_lengths": torch.empty(
-                self._ctx.config.batch_size, dtype=torch.int, pin_memory=prefer_pinned()
+                self._ctx.runner_config.max_batch_size, dtype=torch.int, pin_memory=prefer_pinned()
             ),
             "previous_batch_indices": torch.empty(
-                self._ctx.config.batch_size, dtype=torch.int, pin_memory=prefer_pinned()
+                self._ctx.runner_config.max_batch_size, dtype=torch.int, pin_memory=prefer_pinned()
             ),
             "event": None,
         }
@@ -203,10 +160,10 @@ class EncoderDecoderInputPreparer(InputPreparer):
     ):
         """Prepare a simple BART batch with native collation and reused buffers."""
         buffers = self._acquire_encoder_decoder_host_buffers()
-        position_id_offset = self._ctx.state.encoder_decoder_position_id_offset
+        position_id_offset = self._encoder_decoder_position_id_offset
         if position_id_offset is None:
             position_id_offset = get_position_id_offset(self._ctx.deps.model)
-            self._ctx.state.encoder_decoder_position_id_offset = position_id_offset
+            self._encoder_decoder_position_id_offset = position_id_offset
         (
             request_ids,
             encoder_seq_lens,
@@ -250,12 +207,12 @@ class EncoderDecoderInputPreparer(InputPreparer):
             staged_request_ids = generation_request_ids[:num_previous_batch_requests]
             # Sequence slots are stable for a request's lifetime, so the
             # device indices remain valid while this ordered batch does.
-            if self._ctx.state.encoder_decoder_staged_request_ids != staged_request_ids:
+            if self._encoder_decoder_staged_request_ids != staged_request_ids:
                 previous_slots.copy_(
                     buffers["previous_batch_indices"][:num_previous_batch_requests],
                     non_blocking=True,
                 )
-                self._ctx.state.encoder_decoder_staged_request_ids = staged_request_ids
+                self._encoder_decoder_staged_request_ids = staged_request_ids
             generation_begin = num_context_tokens
             generation_end = generation_begin + num_previous_batch_requests
             torch.index_select(
@@ -265,7 +222,7 @@ class EncoderDecoderInputPreparer(InputPreparer):
                 out=self._ctx.buffers.input_ids_cuda[generation_begin:generation_end],
             )
         else:
-            self._ctx.state.encoder_decoder_staged_request_ids = None
+            self._encoder_decoder_staged_request_ids = None
         dummy_begin = num_context_tokens + num_previous_batch_requests
         if dummy_begin < total_num_tokens:
             self._ctx.buffers.input_ids_cuda[dummy_begin:total_num_tokens].fill_(0)
@@ -368,12 +325,12 @@ class EncoderDecoderInputPreparer(InputPreparer):
         }
         inputs.update(cross_attention_inputs)
 
-        self._ctx.state.iter_states["num_ctx_requests"] = scheduled_requests.num_context_requests
-        self._ctx.state.iter_states["num_ctx_tokens"] = num_context_tokens
-        self._ctx.state.iter_states["num_generation_tokens"] = num_generation_requests
-        self._ctx.state.iter_states["cached_kv_tokens"] = cached_kv_tokens
+        self._ctx.iter_states["num_ctx_requests"] = scheduled_requests.num_context_requests
+        self._ctx.iter_states["num_ctx_tokens"] = num_context_tokens
+        self._ctx.iter_states["num_generation_tokens"] = num_generation_requests
+        self._ctx.iter_states["cached_kv_tokens"] = cached_kv_tokens
         if not self._ctx.is_warmup:
-            self._ctx.state.previous_request_ids = generation_request_ids
+            self._previous_request_ids = generation_request_ids
 
         event = torch.cuda.Event()
         event.record(torch.cuda.current_stream())
@@ -461,9 +418,8 @@ class EncoderDecoderInputPreparer(InputPreparer):
             # and H2D copies inside prepare() when nothing has changed.
             is_stable_gen_step = (
                 new_encoder_tokens == 0  # pure generation, no new cross-KV
-                and self._ctx.state.cross_attn_stable_cached_tokens
-                == encoder_num_cached_tokens_per_seq
-                and self._ctx.state.cross_attn_stable_request_ids
+                and self._cross_attn_stable_cached_tokens == encoder_num_cached_tokens_per_seq
+                and self._cross_attn_stable_request_ids
                 == attn_metadata.request_ids  # same batch and row order
             )
             if is_stable_gen_step:
@@ -484,14 +440,12 @@ class EncoderDecoderInputPreparer(InputPreparer):
                 prepare_cross_metadata(cross_attn_metadata)
                 if new_encoder_tokens == 0:
                     # Record this stable state for future fast-path use.
-                    self._ctx.state.cross_attn_stable_cached_tokens = list(
-                        encoder_num_cached_tokens_per_seq
-                    )
-                    self._ctx.state.cross_attn_stable_request_ids = list(attn_metadata.request_ids)
+                    self._cross_attn_stable_cached_tokens = list(encoder_num_cached_tokens_per_seq)
+                    self._cross_attn_stable_request_ids = list(attn_metadata.request_ids)
                 else:
                     # Batch changed (new encoder request); reset cache.
-                    self._ctx.state.cross_attn_stable_cached_tokens = None
-                    self._ctx.state.cross_attn_stable_request_ids = None
+                    self._cross_attn_stable_cached_tokens = None
+                    self._cross_attn_stable_request_ids = None
         else:
             cross_attn_metadata = attn_metadata.create_cross_metadata(
                 cross_kv_cache_manager=cross_kv_cache_manager,
@@ -501,16 +455,14 @@ class EncoderDecoderInputPreparer(InputPreparer):
             if attn_metadata.is_cuda_graph:
                 attn_metadata.cross = cross_attn_metadata
                 if new_encoder_tokens == 0:
-                    self._ctx.state.cross_attn_stable_cached_tokens = list(
-                        encoder_num_cached_tokens_per_seq
-                    )
-                    self._ctx.state.cross_attn_stable_request_ids = list(attn_metadata.request_ids)
+                    self._cross_attn_stable_cached_tokens = list(encoder_num_cached_tokens_per_seq)
+                    self._cross_attn_stable_request_ids = list(attn_metadata.request_ids)
                 else:
-                    self._ctx.state.cross_attn_stable_cached_tokens = None
-                    self._ctx.state.cross_attn_stable_request_ids = None
+                    self._cross_attn_stable_cached_tokens = None
+                    self._cross_attn_stable_request_ids = None
             else:
-                self._ctx.state.cross_attn_stable_cached_tokens = None
-                self._ctx.state.cross_attn_stable_request_ids = None
+                self._cross_attn_stable_cached_tokens = None
+                self._cross_attn_stable_request_ids = None
             prepare_cross_metadata(cross_attn_metadata)
 
         return {
@@ -523,11 +475,22 @@ class EncoderDecoderInputPreparer(InputPreparer):
 class EncoderDecoderWarmupDriver(WarmupDriver):
     """Warmup for encoder-decoder: cross-KV seeding and mixed-shape capture."""
 
+    def __init__(
+        self,
+        ctx: DecoderContext,
+        preparer: InputPreparer,
+        executor: ForwardExecutor,
+        *,
+        encoder_graph_shapes: Callable[[], frozenset],
+    ) -> None:
+        super().__init__(ctx, preparer, executor)
+        self._encoder_graph_shapes = encoder_graph_shapes
+
     def _max_encoder_output_len(self, resource_manager: ResourceManager) -> int:
         cross_kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.CROSS_KV_CACHE_MANAGER
         )
-        max_encoder_output_len = int(self._ctx.config.max_seq_len)
+        max_encoder_output_len = int(self._ctx.runner_config.max_seq_len)
         if cross_kv_cache_manager is not None:
             max_encoder_output_len = min(
                 max_encoder_output_len,
@@ -636,11 +599,11 @@ class EncoderDecoderWarmupDriver(WarmupDriver):
         shapes. Runtime capture is deliberately disabled because graph capture
         executes KV-cache writes and must never run against live requests.
         """
-        runner = self._ctx.state.cuda_graph_runner
+        runner = self._ctx.cuda_graph_runner
         if not runner.enable_encoder_decoder_mixed_cuda_graph:
             return
         max_encoder_output_len = self._max_encoder_output_len(resource_manager)
-        context_shapes = set(self._ctx.config.encoder_graph_shapes)
+        context_shapes = set(self._encoder_graph_shapes())
         if not context_shapes:
             logger.warning(
                 "Skipping mixed encoder-decoder CUDA graph capture: "
@@ -786,7 +749,12 @@ class EncoderDecoderRunner(DecoderMixin, EncoderMixin):
         return EncoderDecoderInputPreparer(self._ctx)
 
     def _make_warmup(self, preparer: InputPreparer, executor: ForwardExecutor) -> WarmupDriver:
-        return EncoderDecoderWarmupDriver(self._ctx, preparer, executor)
+        # Read late: the encoder half resolves its shapes after this is built.
+        # Through a proxy, so the driver this runner holds does not hold it back.
+        runner = weakref.proxy(self)
+        return EncoderDecoderWarmupDriver(
+            self._ctx, preparer, executor, encoder_graph_shapes=lambda: runner._encoder_graph_shapes
+        )
 
     def cleanup(self) -> None:
         """Release both halves; each side only knows its own."""
@@ -877,10 +845,10 @@ class EncoderDecoderRunner(DecoderMixin, EncoderMixin):
         num_tokens = len(input_ids)
         if num_tokens != len(position_ids):
             raise ValueError("Encoder input IDs and position IDs must have the same length.")
-        if num_tokens > self._config.max_num_tokens:
+        if num_tokens > self._encoder_config.encoder_max_num_tokens:
             raise ValueError(
                 f"Encoder packed length ({num_tokens}) exceeds max_num_tokens "
-                f"({self._config.max_num_tokens})."
+                f"({self._encoder_config.encoder_max_num_tokens})."
             )
 
         return self._prepare_packed_token_inputs(
@@ -909,10 +877,10 @@ class EncoderDecoderRunner(DecoderMixin, EncoderMixin):
             request_ids.append(request.py_request_id)
 
         num_tokens = sum(sequence_lengths)
-        if num_tokens > self._config.max_num_tokens:
+        if num_tokens > self._encoder_config.encoder_max_num_tokens:
             raise ValueError(
                 f"Encoder packed length ({num_tokens}) exceeds max_num_tokens "
-                f"({self._config.max_num_tokens})."
+                f"({self._encoder_config.encoder_max_num_tokens})."
             )
         graph_inputs = self._prepare_encoder_feature_graph_inputs(
             features,

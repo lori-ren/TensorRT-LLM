@@ -67,8 +67,7 @@ class WarmupDriver:
         self._ctx = ctx
         self._preparer = preparer
         self._executor = executor
-
-    """Warmup and CUDA graph capture for the decoder family."""
+        self._capture_sample_type = None
 
     def warmup(self, resource_manager: ResourceManager) -> None:
         """Warm up and capture this family's graphs.
@@ -91,7 +90,7 @@ class WarmupDriver:
                 self._ctx.deps.model.config.vocab_size,
                 torch.device("cuda"),
                 self._ctx.config.dtype,
-                self._ctx.config.cuda_graph_batch_sizes or [],
+                self._ctx.config.decoder_cuda_graph_batch_sizes or [],
             )
 
         if kv_cache_manager is None:
@@ -100,7 +99,7 @@ class WarmupDriver:
 
         # The lifetime of model engine and kv cache manager can be different.
         # Reset the global cuda graph dummy requests in warmup.
-        self._ctx.state.cuda_graph_runner.padding_dummy_requests = {}
+        self._ctx.cuda_graph_runner.padding_dummy_requests = {}
 
         is_enc_dec = self._ctx.is_encoder_decoder
         if self._ctx.deps.mapping.cp_size > 1:
@@ -123,7 +122,7 @@ class WarmupDriver:
             not is_enc_dec
             and not self._ctx.config.is_draft_model
             and not self._ctx.deps.mapping.has_cp_helix()
-            and self._ctx.state.guided_decoder is None
+            and self._ctx.guided_decoder is None
             and not isinstance(kv_cache_manager, MambaHybridCacheManager)
         )
 
@@ -180,14 +179,14 @@ class WarmupDriver:
         # Capture with the steady-state MoE all-to-all budget: the timeout is a
         # launch argument and is baked into every later replay.
         with _moe_a2a_steady_state_budget_for_capture():
-            with self._ctx.state.cuda_graph_runner.allow_capture():
-                self._ctx.state.cuda_graph_runner.is_warmup_only = True
+            with self._ctx.cuda_graph_runner.allow_capture():
+                self._ctx.cuda_graph_runner.is_warmup_only = True
                 try:
                     with self.maybe_autotune_lora():
                         self._run_cuda_graph_warmup(resource_manager)
                 finally:
-                    self._ctx.state.cuda_graph_runner.is_warmup_only = False
-                self._ctx.state.cuda_graph_runner.padding_dummy_requests = {}
+                    self._ctx.cuda_graph_runner.is_warmup_only = False
+                self._ctx.cuda_graph_runner.padding_dummy_requests = {}
                 self._run_cuda_graph_warmup(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
@@ -217,7 +216,7 @@ class WarmupDriver:
         # empty. Waiting for the first padded step can race KV saturation:
         # once the cache is full, the lazy allocation in _get_padded_batch
         # fails every step and padded batches silently run eager.
-        self._ctx.state.cuda_graph_runner.preallocate_padding_dummies(resource_manager)
+        self._ctx.cuda_graph_runner.preallocate_padding_dummies(resource_manager)
         log_mem_snapshot("warmup/after_preallocate_padding_dummies")
 
         # If this is a BOLT-instrumented build (the profile-gen job sets
@@ -233,17 +232,19 @@ class WarmupDriver:
 
     def _capture_generation_cuda_graphs(self, resource_manager: ResourceManager):
         """Warm up or capture pure-generation CUDA graph shapes."""
-        if not self._ctx.state.cuda_graph_runner.enabled:
+        if not self._ctx.cuda_graph_runner.enabled:
             return
 
-        operation = "warmup" if self._ctx.state.cuda_graph_runner.is_warmup_only else "capture"
+        operation = "warmup" if self._ctx.cuda_graph_runner.is_warmup_only else "capture"
         logger.info(
             f"Running CUDA graph {operation} for "
-            f"{len(self._ctx.config.cuda_graph_batch_sizes)} batch sizes."
+            f"{len(self._ctx.config.decoder_cuda_graph_batch_sizes)} batch sizes."
         )
 
         # Reverse order so smaller graphs can reuse memory from larger ones
-        cuda_graph_batch_sizes = sorted(self._ctx.config.cuda_graph_batch_sizes, reverse=True)
+        cuda_graph_batch_sizes = sorted(
+            self._ctx.config.decoder_cuda_graph_batch_sizes, reverse=True
+        )
 
         # Determine which graph shapes to process.
         graphs_to_capture = self._get_graphs_to_capture(cuda_graph_batch_sizes)
@@ -253,9 +254,11 @@ class WarmupDriver:
         # rank only holds max_seq_len / cp_size tokens, so scale accordingly to
         # avoid creating warmup requests whose position_ids exceed the RoPE
         # table (max_position_embeddings).
-        effective_max_seq_len = self._ctx.config.max_seq_len
+        effective_max_seq_len = self._ctx.runner_config.max_seq_len
         if self._ctx.deps.mapping is not None and self._ctx.deps.mapping.has_cp_helix():
-            effective_max_seq_len = self._ctx.config.max_seq_len // self._ctx.deps.mapping.cp_size
+            effective_max_seq_len = (
+                self._ctx.runner_config.max_seq_len // self._ctx.deps.mapping.cp_size
+            )
 
         sparse_config = self._ctx.config.sparse_attention_config
         if (
@@ -265,7 +268,7 @@ class WarmupDriver:
             # For short sequences, subtract the maximum runtime tokens consumed
             # by a generation step so all current-step tokens stay within the
             # sequence length threshold. PARD uses 2K tokens here, not K+1.
-            max_runtime_tokens_per_gen_step = self._ctx.get_runtime_tokens_per_gen_step(
+            max_runtime_tokens_per_gen_step = self._ctx.deps.spec.runtime_tokens_per_gen_step(
                 self._ctx.config.max_draft_len
             )
             # For long sequences, use the default maximum sequence length.
@@ -369,11 +372,11 @@ class WarmupDriver:
             # a tier capture FULL graphs -- ones carrying no sampling at all --
             # which is what a batch resolving to FULL replays.
             pinned_tier = sample_type or SampleType.FULL
-            self._ctx.state.capture_sample_type = pinned_tier
-            self._ctx.state.cuda_graph_runner.set_capture_sample_type(pinned_tier)
+            self._capture_sample_type = pinned_tier
+            self._ctx.cuda_graph_runner.set_capture_sample_type(pinned_tier)
             try:
                 for bs, draft_len in graphs_to_capture:
-                    if bs > self._ctx.config.batch_size:
+                    if bs > self._ctx.runner_config.max_batch_size:
                         continue
 
                     for max_seq_len in max_seq_len_list:
@@ -421,12 +424,12 @@ class WarmupDriver:
                                 torch.cuda.synchronize()
             finally:
                 self._ctx.state.force_lora_graph_for_capture = None
-                self._ctx.state.capture_sample_type = None
-                self._ctx.state.cuda_graph_runner.set_capture_sample_type(None)
+                self._capture_sample_type = None
+                self._ctx.cuda_graph_runner.set_capture_sample_type(None)
 
         if self._ctx.state.cuda_graph_lora_manager is None:
             lora_graph_cases = [False]
-        elif self._ctx.config.llm_args.lora_config.cuda_graph_specialize_lora:
+        elif self._ctx.config.cuda_graph_specialize_lora:
             # Capture the larger LoRA graph first so the base-only graph can
             # reuse its CUDA graph memory-pool allocations.
             lora_graph_cases = [True, False]
@@ -494,8 +497,8 @@ class WarmupDriver:
         # spec_metadata. Reset it so the first real iteration starts clean;
         # update_is_all_greedy_sample will refresh it on every iteration anyway.
         # This is a defensive guard.
-        if self._ctx.state.spec_metadata is not None:
-            self._ctx.state.spec_metadata.is_all_greedy_sample = True
+        if self._ctx.spec_metadata is not None:
+            self._ctx.spec_metadata.is_all_greedy_sample = True
 
     def _create_cuda_graph_warmup_request(
         self,
@@ -517,12 +520,14 @@ class WarmupDriver:
         )
         draft_kv_cache_manager = self._ctx.get_draft_kv_cache_manager(resource_manager)
 
-        available_blocks = kv_cache_manager.get_num_free_blocks() // self._ctx.config.max_beam_width
+        available_blocks = (
+            kv_cache_manager.get_num_free_blocks() // self._ctx.runner_config.max_beam_width
+        )
         if available_blocks < batch_size:
             return None
 
         result = ScheduledRequests()
-        runtime_tokens_per_gen_step = self._ctx.get_runtime_tokens_per_gen_step(draft_len)
+        runtime_tokens_per_gen_step = self._ctx.deps.spec.runtime_tokens_per_gen_step(draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
         is_enc_dec = self._ctx.is_encoder_decoder
         max_encoder_output_len = (
@@ -545,7 +550,7 @@ class WarmupDriver:
                 max_num_draft_tokens=runtime_draft_token_buffer_width,
                 kv_reserve_draft_tokens=self._ctx.config.max_draft_loop_tokens,
                 use_mrope=self._ctx.use_mrope,
-                max_beam_width=self._ctx.config.max_beam_width,
+                max_beam_width=self._ctx.runner_config.max_beam_width,
                 encoder_output_lens=list(mixed_context_encoder_output_lens),
                 draft_kv_cache_manager=draft_kv_cache_manager,
                 capture_sampling_params=capture_sampling_params,
@@ -563,7 +568,7 @@ class WarmupDriver:
                     max_num_draft_tokens=runtime_draft_token_buffer_width,
                     kv_reserve_draft_tokens=self._ctx.config.max_draft_loop_tokens,
                     use_mrope=self._ctx.use_mrope,
-                    max_beam_width=self._ctx.config.max_beam_width,
+                    max_beam_width=self._ctx.runner_config.max_beam_width,
                     encoder_output_lens=[max_encoder_output_len] * len(generation_request_ids),
                     draft_kv_cache_manager=draft_kv_cache_manager,
                     capture_sampling_params=capture_sampling_params,
@@ -589,7 +594,7 @@ class WarmupDriver:
                 max_num_draft_tokens=runtime_draft_token_buffer_width,
                 kv_reserve_draft_tokens=self._ctx.config.max_draft_loop_tokens,
                 use_mrope=self._ctx.use_mrope,
-                max_beam_width=self._ctx.config.max_beam_width,
+                max_beam_width=self._ctx.runner_config.max_beam_width,
                 encoder_output_lens=encoder_output_lens,
                 draft_kv_cache_manager=draft_kv_cache_manager,
                 capture_sampling_params=capture_sampling_params,
@@ -605,7 +610,7 @@ class WarmupDriver:
 
         # Add one dummy request with the maximum possible sequence length.
         max_seq_len = min(
-            self._ctx.config.max_seq_len if max_seq_len is None else max_seq_len,
+            self._ctx.runner_config.max_seq_len if max_seq_len is None else max_seq_len,
             kv_cache_manager.max_seq_len,
         )
 
@@ -657,7 +662,7 @@ class WarmupDriver:
             max_num_draft_tokens=runtime_draft_token_buffer_width,
             kv_reserve_draft_tokens=self._ctx.config.max_draft_loop_tokens,
             use_mrope=self._ctx.use_mrope,
-            max_beam_width=self._ctx.config.max_beam_width,
+            max_beam_width=self._ctx.runner_config.max_beam_width,
             encoder_output_lens=[max_encoder_output_len] if is_enc_dec else None,
             draft_kv_cache_manager=draft_kv_cache_manager,
             capture_sampling_params=capture_sampling_params,
@@ -699,7 +704,7 @@ class WarmupDriver:
         )
         from .....modules.linear import MXFP8LinearMethod, flashinfer_mxfp8_autotune
 
-        enable_trtllm_autotuner = self._ctx.config.llm_args.enable_autotuner
+        enable_trtllm_autotuner = self._ctx.runner_config.enable_autotuner
         if not enable_trtllm_autotuner:
             return
 
@@ -719,7 +724,7 @@ class WarmupDriver:
         # eligibility before enabling graph-only FlashInfer dispatch.
         native_mxfp8_methods = [method for method in mxfp8_methods if method.needs_native_autotune]
         use_mxfp8_flashinfer_graph_default = (
-            self._ctx.state.cuda_graph_runner.enabled
+            self._ctx.cuda_graph_runner.enabled
             and "TRTLLM_MXFP8_GEMM_BACKEND" not in os.environ
             and any(
                 getattr(module, "_use_flashinfer_mxfp8_decode_graph_default", False)
@@ -783,8 +788,8 @@ class WarmupDriver:
             self._ctx.config.kv_cache_manager_key
         )
         token_num_upper_bound = min(
-            self._ctx.config.decoder_max_num_tokens,
-            self._ctx.config.batch_size * (self._ctx.config.max_seq_len - 1),
+            self._ctx.runner_config.max_num_tokens,
+            self._ctx.runner_config.max_batch_size * (self._ctx.runner_config.max_seq_len - 1),
         )
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
@@ -794,7 +799,7 @@ class WarmupDriver:
         warmup_configs = [(curr_max_num_tokens, 0)]
         if (
             not self._ctx.config.is_draft_model
-            and self._ctx.state.guided_decoder is None
+            and self._ctx.guided_decoder is None
             and not self._ctx.deps.mapping.has_pp()
         ):
             # Add generation request to warmup the autotuner cache.
@@ -939,8 +944,8 @@ class WarmupDriver:
             return
 
         token_num_upper_bound = min(
-            self._ctx.config.decoder_max_num_tokens,
-            self._ctx.config.batch_size * (self._ctx.config.max_seq_len - 1),
+            self._ctx.runner_config.max_num_tokens,
+            self._ctx.runner_config.max_batch_size * (self._ctx.runner_config.max_seq_len - 1),
         )
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
@@ -979,7 +984,7 @@ class WarmupDriver:
             (capped_num_tokens, 0, False, True),
         ]
 
-        autotuner_enabled = self._ctx.config.llm_args.enable_autotuner
+        autotuner_enabled = self._ctx.runner_config.enable_autotuner
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
         autotune_ctx = (
             autotune(cache_path=cache_path) if autotuner_enabled else contextlib.nullcontext()
@@ -1094,13 +1099,13 @@ class WarmupDriver:
             max_num_draft_tokens=self._ctx.config.max_total_draft_tokens,
         )
         available_blocks = kv_cache_manager.get_num_free_blocks()
-        if num_tokens > self._ctx.config.decoder_max_num_tokens or num_tokens > available_tokens:
+        if num_tokens > self._ctx.runner_config.max_num_tokens or num_tokens > available_tokens:
             return None
 
-        if num_gen_requests > self._ctx.config.batch_size:
+        if num_gen_requests > self._ctx.runner_config.max_batch_size:
             return None
         num_gen_tokens = num_gen_requests * (1 + self._ctx.config.max_total_draft_tokens)
-        if num_gen_tokens > self._ctx.config.decoder_max_num_tokens:
+        if num_gen_tokens > self._ctx.runner_config.max_num_tokens:
             return None
 
         num_ctx_tokens = num_tokens - num_gen_tokens
@@ -1109,13 +1114,13 @@ class WarmupDriver:
         gen_requests = []
 
         # Leave room for at least one decode token per request.
-        max_seq_len = self._ctx.config.max_seq_len - 1
+        max_seq_len = self._ctx.runner_config.max_seq_len - 1
         if max_seq_len < 1:
             return None
         num_full_seqs = 0
         num_left_over_tokens = 0
 
-        max_context_requests = self._ctx.config.batch_size - num_gen_requests
+        max_context_requests = self._ctx.runner_config.max_batch_size - num_gen_requests
         if max_context_requests * max_seq_len < num_ctx_tokens:
             return None
 
@@ -1134,7 +1139,7 @@ class WarmupDriver:
                 num_left_over_tokens = num_ctx_tokens - max_seq_len * num_full_seqs
             num_ctx_requests = num_full_seqs + (1 if num_left_over_tokens > 0 else 0)
 
-        if num_ctx_requests + num_gen_requests > self._ctx.config.batch_size:
+        if num_ctx_requests + num_gen_requests > self._ctx.runner_config.max_batch_size:
             return None  # Not enough batch size to fill the request
 
         # Mirror add_dummy_requests' actual allocation: on top of the raw
@@ -1158,7 +1163,7 @@ class WarmupDriver:
             blocks_to_use += blocks_for_seq(num_left_over_tokens + extra_ctx_tokens)
         blocks_to_use += (
             num_gen_requests
-            * self._ctx.config.max_beam_width
+            * self._ctx.runner_config.max_beam_width
             * blocks_for_seq(1 + extra_gen_tokens)
         )
 
@@ -1194,7 +1199,7 @@ class WarmupDriver:
                 max_num_draft_tokens=self._ctx.config.max_total_draft_tokens,
                 kv_reserve_draft_tokens=self._ctx.config.max_draft_loop_tokens,
                 use_mrope=self._ctx.use_mrope,
-                max_beam_width=self._ctx.config.max_beam_width,
+                max_beam_width=self._ctx.runner_config.max_beam_width,
                 draft_kv_cache_manager=draft_kv_cache_manager,
             )
 
@@ -1275,7 +1280,7 @@ class WarmupDriver:
             return
 
         num_sms = attn_meta.num_sms
-        max_bs = max(1, int(self._ctx.config.batch_size))
+        max_bs = max(1, int(self._ctx.runner_config.max_batch_size))
         beam_width = max(1, int(getattr(self, "max_beam_width", 1) or 1))
         # Static upper bound on the row-count multiplier applied to
         # `context_lens`. Both MTP-expanded and DSL-expanded call sites
@@ -1343,8 +1348,8 @@ class WarmupDriver:
                         continue
 
                     logger.info(f"Run prefill CUDA graph capture for num tokens={num_tokens}")
-                    if self._ctx.state.breakable_cuda_graph_runner is not None:
-                        self._ctx.state.breakable_cuda_graph_runner.capture(
+                    if self._ctx.breakable_cuda_graph_runner is not None:
+                        self._ctx.breakable_cuda_graph_runner.capture(
                             num_tokens, lambda: self._executor._run_batch(batch, resource_manager)
                         )
                     else:
@@ -1366,9 +1371,9 @@ class WarmupDriver:
                 logger.info(
                     f"Run prefill CUDA graph warmup for num tokens={num_tokens} with most requests"
                 )
-                if self._ctx.state.breakable_cuda_graph_runner is not None:
+                if self._ctx.breakable_cuda_graph_runner is not None:
                     with self.no_cuda_graph():
-                        self._ctx.state.breakable_cuda_graph_runner.warmup(
+                        self._ctx.breakable_cuda_graph_runner.warmup(
                             lambda: self._executor._run_batch(batch, resource_manager), steps=1
                         )
                 else:
@@ -1378,7 +1383,9 @@ class WarmupDriver:
     def _run_attention_warmup(
         self, resource_manager: ResourceManager, can_run_general_warmup: bool = True
     ) -> None:
-        if not issubclass(self._ctx.config.attention_backend.Metadata, TrtllmAttentionMetadata):
+        if not issubclass(
+            self._ctx.runner_config.attention_backend.Metadata, TrtllmAttentionMetadata
+        ):
             return
 
         @contextlib.contextmanager
@@ -1393,7 +1400,7 @@ class WarmupDriver:
         logger.info("Running TRTLLM-Gen FMHA JIT warmup")
 
         warmup_requests_configs = []
-        if not self._ctx.config.is_draft_model and self._ctx.state.guided_decoder is None:
+        if not self._ctx.config.is_draft_model and self._ctx.guided_decoder is None:
             # doesn't support 2-model speculative draft and guided decoding
             warmup_requests_configs.append(
                 (1 + self._ctx.config.max_total_draft_tokens, 1)
@@ -1422,7 +1429,7 @@ class WarmupDriver:
 
         if (
             not self._ctx.config.is_draft_model
-            and self._ctx.state.guided_decoder is None
+            and self._ctx.guided_decoder is None
             and can_run_general_warmup
         ):
             # The cute_dsl_mla FMHA lib now only support the generation-only batch, we need to warmup the TRTLLM-Gen
@@ -1686,7 +1693,7 @@ class WarmupDriver:
     def _run_cuda_graph_warmup(self, resource_manager: ResourceManager):
         """Warm up or capture CUDA graphs for the configured graph shapes."""
         if not (
-            self._ctx.state.cuda_graph_runner.enabled
+            self._ctx.cuda_graph_runner.enabled
             or self._ctx.config.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED
         ):
             return
@@ -1710,7 +1717,7 @@ class WarmupDriver:
         ]
         flashinfer_autotune_context = (
             flashinfer_mxfp8_autotune()
-            if self._ctx.state.cuda_graph_runner.is_warmup_only and flashinfer_methods
+            if self._ctx.cuda_graph_runner.is_warmup_only and flashinfer_methods
             else contextlib.nullcontext()
         )
         with flashinfer_autotune_context, flashinfer_mxfp8_decode_graph_capture():
@@ -1718,7 +1725,7 @@ class WarmupDriver:
         self._capture_mixed_cuda_graphs(resource_manager)
         # Piecewise graphs have separate capture machinery and do not use the
         # whole-model attention workspace. Capture them only on the second pass.
-        if not self._ctx.state.cuda_graph_runner.is_warmup_only:
+        if not self._ctx.cuda_graph_runner.is_warmup_only:
             self._capture_prefill_cuda_graphs(resource_manager)
 
     def _assert_all_tp_ranks_have_warmup_batch(self, batch, num_tokens: int) -> None:
@@ -1798,7 +1805,7 @@ class WarmupDriver:
             attn_meta.warmup_cute_dsl_radix_topk(next_n)
             if hasattr(attn_meta, "warmup_selfsampling_topk"):
                 attn_meta.warmup_selfsampling_topk(
-                    next_n, batch_sizes=self._ctx.config.cuda_graph_batch_sizes
+                    next_n, batch_sizes=self._ctx.config.decoder_cuda_graph_batch_sizes
                 )
 
     def _get_max_shape_warmup_requests(
@@ -1812,18 +1819,18 @@ class WarmupDriver:
             self._ctx.config.kv_cache_manager_key
         )
         token_num_upper_bound = min(
-            self._ctx.config.decoder_max_num_tokens,
-            self._ctx.config.batch_size * (self._ctx.config.max_seq_len - 1),
+            self._ctx.runner_config.max_num_tokens,
+            self._ctx.runner_config.max_batch_size * (self._ctx.runner_config.max_seq_len - 1),
         )
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self._ctx.config.original_max_draft_len,
         )
         max_batch_size = min(
-            self._ctx.config.batch_size,
+            self._ctx.runner_config.max_batch_size,
             curr_max_num_tokens
             // (1 + self._ctx.config.max_draft_loop_tokens)
-            // self._ctx.config.max_beam_width,
+            // self._ctx.runner_config.max_beam_width,
         )
 
         warmup_requests_configs = [
@@ -1843,7 +1850,7 @@ class WarmupDriver:
             from .....attention.backends.sparse.dsa import DSAtrtllmAttentionMetadata
         except ImportError:
             return
-        metadata_cls = getattr(self._ctx.config.attention_backend, "Metadata", None)
+        metadata_cls = getattr(self._ctx.runner_config.attention_backend, "Metadata", None)
         if metadata_cls is None or not issubclass(metadata_cls, DSAtrtllmAttentionMetadata):
             return
         kv_cache_manager = resource_manager.get_resource_manager(
@@ -1931,7 +1938,7 @@ class WarmupDriver:
     def maybe_autotune_lora(self):
         """Enable autotuning while warming up CUDA-graph LoRA kernels."""
         if not (
-            self._ctx.config.llm_args.enable_autotuner
+            self._ctx.runner_config.enable_autotuner
             and self._ctx.state.cuda_graph_lora_manager is not None
         ):
             yield
@@ -2015,15 +2022,15 @@ class WarmupDriver:
 
     @contextlib.contextmanager
     def no_cuda_graph(self):
-        if self._ctx.state.cuda_graph_runner is None:
+        if self._ctx.cuda_graph_runner is None:
             yield
             return
-        _run_cuda_graphs = self._ctx.state.cuda_graph_runner.enabled
-        self._ctx.state.cuda_graph_runner.enabled = False
+        _run_cuda_graphs = self._ctx.cuda_graph_runner.enabled
+        self._ctx.cuda_graph_runner.enabled = False
         try:
             yield
         finally:
-            self._ctx.state.cuda_graph_runner.enabled = _run_cuda_graphs
+            self._ctx.cuda_graph_runner.enabled = _run_cuda_graphs
 
     def _is_distributed_forward(self) -> bool:
         """Return whether model forward can communicate with peer workers.

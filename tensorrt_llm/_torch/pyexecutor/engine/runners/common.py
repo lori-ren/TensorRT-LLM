@@ -4,6 +4,7 @@
 """Shared helpers used by multiple model-runner families."""
 
 import bisect
+import inspect
 import math
 from typing import Any
 
@@ -12,6 +13,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_multimodal_utils import filter_mm_token_from_input_ids
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
@@ -222,3 +224,78 @@ def ship_multimodal_indices(
         text_token_indices_cpu = torch.cat([text_token_indices_cpu, extra_text])
     text_token_indices_cpu = maybe_pin_memory(text_token_indices_cpu)
     inputs["text_token_indices"] = text_token_indices_cpu.to("cuda", non_blocking=True)
+
+
+def execute_logit_post_processors(
+    mapping: Mapping, scheduled_requests: ScheduledRequests, outputs: dict
+) -> None:
+    """Apply logit post processors (in-place modify outputs Tensors) if any."""
+
+    if not (mapping.is_last_pp_rank()):
+        return
+
+    if not isinstance(outputs, dict) or "logits" not in outputs:
+        # TODO: support models that don't return outputs as dict
+        return
+
+    logits_tensor = outputs["logits"]
+
+    logits_row_offset = 0
+    request_groups = (
+        (scheduled_requests.context_requests, True),
+        (scheduled_requests.generation_requests, False),
+    )
+
+    for requests, is_context_request in request_groups:
+        for request in requests:
+            if is_context_request:
+                beam_width = 1
+                row_stride = 1
+            else:
+                # Generation rows are laid out at the static admission
+                # width, so that is the stride between requests, while
+                # only the leading beam_width rows hold live beams under
+                # a variable beam width array. Advancing the offset by the
+                # narrower width would make every request after the first
+                # rewrite another request's logits rows in place.
+                beam_width = request.get_beam_width_by_iter(for_next_iteration=False)
+                row_stride = request.py_beam_width
+
+            logits_processors = getattr(request, "py_logits_post_processors", None)
+            if logits_processors:
+                token_ids = (
+                    [request.get_tokens(0)]
+                    if is_context_request
+                    else [request.get_tokens(beam_idx) for beam_idx in range(beam_width)]
+                )
+                if is_context_request and request.py_orig_prompt_len < len(token_ids[0]):
+                    # Skip as we only need to apply logit processor on the last context request
+                    logits_row_offset += row_stride
+                    continue
+
+                _apply_logits_processors(
+                    request,
+                    logits_processors,
+                    logits_tensor,
+                    beam_width,
+                    token_ids,
+                    logits_row_offset,
+                )
+            logits_row_offset += row_stride
+
+
+def _apply_logits_processors(
+    request, logits_processors, logits_tensor, beam_width, token_ids, logits_row_offset
+):
+    logits_rows = logits_tensor[logits_row_offset : logits_row_offset + beam_width]
+    # Reshape to align w/ the shape used in the TRT backend,
+    # so the same logit processors can be used across both backends.
+    logits_rows = logits_rows.view(beam_width, 1, -1)
+    for lp in logits_processors:
+        lp_params = inspect.signature(lp).parameters
+
+        assert 4 <= len(lp_params) <= 5, (
+            "Logit post processor signature must match the `LogitsProcessor` interface "
+            "defined in `tensorrtllm.sampling_params`."
+        )
+        lp(request.py_request_id, logits_rows, token_ids, None, None)

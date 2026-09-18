@@ -46,6 +46,7 @@ from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from .engine.cuda_graph import filter_cuda_graph_batch_sizes
 from .engine.lora import (LoraParamBuilder, make_cuda_graph_lora_manager,
                           make_lora_model_config)
+from .engine.model_call import ModelCaller
 from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
                                 mm_encoder_cache_enabled,
                                 setup_mm_encoder_attn_metadata)
@@ -53,13 +54,13 @@ from .engine.runners import resolve_runner_type
 from .engine.runners.common import _set_moe_a2a_warmup
 from .engine.runners.decoder import (DecoderBuffers, DecoderRunner,
                                      DecoderRunnerConfig)
-from .engine.runners.decoder.forward import ForwardMixin
 from .engine.runners.encoder import EncoderRunner, EncoderRunnerConfig
 from .engine.runners.encoder_decoder import (EncoderDecoderRunner,
                                              EncoderDecoderRunnerConfig)
 from .engine.runners.interface import (ModelRunner, PackedEncoderBatch,
                                        PackedModelRunner, RunnerDeps)
 from .engine.runners.no_kv_cache import NoKVCacheRunner, NoKVCacheRunnerConfig
+from .engine.spec_decode import SpecMetadataBuilder
 from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import LlmRequest
@@ -647,6 +648,28 @@ class PyTorchModelEngine(ModelEngine):
         self._force_lora_graph_for_capture: Optional[bool] = None
         self._lora = LoraParamBuilder(spec_config=self.spec_config,
                                       attn_backend=self.attn_backend)
+        self._model_caller = ModelCaller(
+            self.model,
+            torch_compile_backend=self._torch_compile_backend,
+            backend_num_streams=getattr(self, "backend_num_streams", None))
+        self._spec = SpecMetadataBuilder(
+            spec_config=self.spec_config,
+            model_config=self.model.config,
+            is_draft_model=self.is_draft_model,
+            original_max_draft_len=self.original_max_draft_len,
+            original_max_total_draft_tokens=self.
+            original_max_total_draft_tokens,
+            spec_dec_max_total_draft_tokens=self.
+            _spec_dec_max_total_draft_tokens,
+            max_batch_size=self.batch_size,
+            max_num_tokens=self.max_num_tokens,
+            max_seq_len=self.max_seq_len,
+            # The disaggregated attention-DP overlap path opts into larger
+            # metadata buffers. None keeps the established max_num_requests
+            # fallback for other configurations, including PP.
+            num_seq_slots=(self.max_num_seq_slots if
+                           self._enable_disagg_adp_overlap_headroom else None),
+            attn_backend=self.attn_backend)
         # Sampling tier pinned during an in-graph sampling capture pass; None outside
         # capture, where the tier comes from the batch instead.
         self._capture_sample_type: Optional[SampleType] = None
@@ -746,35 +769,35 @@ class PyTorchModelEngine(ModelEngine):
 
     @property
     def forward_pass_callable(self):
-        return self._runner._ctx.state.forward_pass_callable
+        return self._runner.forward_pass_callable
 
     @forward_pass_callable.setter
     def forward_pass_callable(self, value) -> None:
-        self._runner._ctx.state.forward_pass_callable = value
+        self._runner.forward_pass_callable = value
 
     @property
     def sample_in_graph_callable(self):
-        return self._runner._ctx.state.sample_in_graph_callable
+        return self._runner.sample_in_graph_callable
 
     @sample_in_graph_callable.setter
     def sample_in_graph_callable(self, value) -> None:
-        self._runner._ctx.state.sample_in_graph_callable = value
+        self._runner.sample_in_graph_callable = value
 
     @property
     def guided_decoder(self):
-        return self._runner._ctx.state.guided_decoder
+        return self._runner.guided_decoder
 
     @guided_decoder.setter
     def guided_decoder(self, value) -> None:
-        self._runner._ctx.state.guided_decoder = value
+        self._runner.guided_decoder = value
 
     @property
     def iter_states(self):
-        return self._runner._ctx.state.iter_states
+        return self._runner.iter_states
 
     @iter_states.setter
     def iter_states(self, value) -> None:
-        self._runner._ctx.state.iter_states = value
+        self._runner.iter_states = value
 
     @property
     def enable_spec_decode(self) -> bool:
@@ -794,19 +817,19 @@ class PyTorchModelEngine(ModelEngine):
 
     @property
     def attn_metadata(self):
-        return self._runner._ctx.state.attn_metadata
+        return self._runner.attn_metadata
 
     @attn_metadata.setter
     def attn_metadata(self, value) -> None:
-        self._runner._ctx.state.attn_metadata = value
+        self._runner.attn_metadata = value
 
     @property
     def spec_metadata(self):
-        return self._runner._ctx.state.spec_metadata
+        return self._runner.spec_metadata
 
     @spec_metadata.setter
     def spec_metadata(self, value) -> None:
-        self._runner._ctx.state.spec_metadata = value
+        self._runner.spec_metadata = value
 
     def _initialize_runner(
         self, runner_cls: Optional[Type[Union[ModelRunner, PackedModelRunner]]]
@@ -870,6 +893,38 @@ class PyTorchModelEngine(ModelEngine):
                for name in names},
         )
 
+    def _decoder_settings(self) -> Dict[str, Any]:
+        """What the decoder half is configured with, for either composition."""
+        return dict(
+            spec_config=self.spec_config,
+            is_draft_model=self.is_draft_model,
+            original_max_draft_len=self.original_max_draft_len,
+            dtype=self.dtype,
+            kv_cache_manager_key=self.kv_cache_manager_key,
+            cuda_graph_specialize_lora=(
+                self.llm_args.lora_config.cuda_graph_specialize_lora),
+            input_processor=getattr(self, "input_processor", None),
+            lora_model_config=getattr(self, "lora_model_config", None),
+            initial_runtime_draft_len=self._initial_runtime_draft_len,
+            max_total_draft_tokens=self.max_total_draft_tokens,
+            max_draft_len=self.max_draft_len,
+            max_draft_loop_tokens=getattr(self, "max_draft_loop_tokens", 0),
+            enable_attention_dp=self.enable_attention_dp,
+            disable_overlap_scheduler=self._disable_overlap_scheduler,
+            enable_in_graph_sampling=self.enable_in_graph_sampling,
+            sparse_attention_config=self.sparse_attention_config,
+            prefill_cuda_graph_backend=self.prefill_cuda_graph_backend,
+            prefill_cuda_graph_num_tokens=self._prefill_cuda_graph_num_tokens,
+            decoder_cuda_graph_batch_sizes=self._cuda_graph_batch_sizes,
+            dynamic_draft_len_mapping=self._dynamic_draft_len_mapping,
+            steady_gen_positions_pinned=getattr(self,
+                                                "_steady_gen_positions_pinned",
+                                                None),
+            torch_compile_enabled=self._torch_compile_enabled,
+            torch_compile_piecewise_cuda_graph=(
+                self._torch_compile_piecewise_cuda_graph),
+            cache_indirection_attention=self.cache_indirection_attention)
+
     def _decoder_runner_config(self) -> DecoderRunnerConfig:
         return DecoderRunnerConfig(
             max_batch_size=self.batch_size,
@@ -879,90 +934,59 @@ class PyTorchModelEngine(ModelEngine):
             without_logits=self.without_logits,
             attention_backend=self.attn_backend,
             attention_runtime_features=self.attn_runtime_features,
-            batch_size=self.batch_size,
-            decoder_max_num_tokens=self.max_num_tokens,
-            dtype=self.dtype,
-            is_draft_model=self.is_draft_model,
-            is_spec_decode=self.is_spec_decode,
-            spec_config=self.spec_config,
-            kv_cache_manager_key=self.kv_cache_manager_key,
-            llm_args=self.llm_args,
-            input_processor=getattr(self, "input_processor", None),
-            lora_model_config=getattr(self, "lora_model_config", None),
-            lora=self._lora,
-            moe_load_balancer=self.moe_load_balancer,
-            original_max_draft_len=self.original_max_draft_len,
-            original_max_total_draft_tokens=self.
-            original_max_total_draft_tokens,
-            spec_dec_max_total_draft_tokens=self.
-            _spec_dec_max_total_draft_tokens,
-            initial_runtime_draft_len=self._initial_runtime_draft_len,
-            max_total_draft_tokens=self.max_total_draft_tokens,
-            max_draft_len=self.max_draft_len,
-            max_draft_loop_tokens=getattr(self, "max_draft_loop_tokens", 0),
-            max_num_seq_slots=getattr(self, "max_num_seq_slots", 0),
-            enable_attention_dp=self.enable_attention_dp,
-            disable_overlap_scheduler=self._disable_overlap_scheduler,
-            enable_in_graph_sampling=self.enable_in_graph_sampling,
-            enable_disagg_adp_overlap_headroom=getattr(
-                self, "_enable_disagg_adp_overlap_headroom", False),
-            sparse_attention_config=self.sparse_attention_config,
-            prefill_cuda_graph_backend=self.prefill_cuda_graph_backend,
-            prefill_cuda_graph_num_tokens=self._prefill_cuda_graph_num_tokens,
-            cuda_graph_batch_sizes=self._cuda_graph_batch_sizes,
-            dynamic_draft_len_mapping=self._dynamic_draft_len_mapping,
-            encoder_graph_shapes=self._encoder_graph_shapes,
-            steady_gen_positions_pinned=getattr(self,
-                                                "_steady_gen_positions_pinned",
-                                                None),
-            torch_compile_enabled=self._torch_compile_enabled,
-            torch_compile_piecewise_cuda_graph=(
-                self._torch_compile_piecewise_cuda_graph),
-            torch_compile_backend=self._torch_compile_backend,
-            backend_num_streams=getattr(self, "backend_num_streams", None),
-            cache_indirection_attention=self.cache_indirection_attention,
+            enable_autotuner=self.llm_args.enable_autotuner,
+            **self._decoder_settings(),
         )
 
     def _initialize_decoder_runner(
             self, runner_cls: Type[DecoderRunner]) -> DecoderRunner:
+        # Do not retain the engine through the flag's closure: the runner is
+        # reachable from the engine, and `cleanup` only runs from `__del__`.
+        engine = weakref.proxy(self)
         return runner_cls(
             self.model,
             self._create_runner_deps(),
             self._decoder_runner_config(),
             self._decoder_runner_buffers(),
-            warmup_flag=lambda: self.is_warmup,
+            warmup_flag=lambda: engine.is_warmup,
         )
 
     def _install_runner_collaborators(self) -> None:
         """Hand the family the graph runners the engine built for it."""
-        state = self._runner._ctx.state
-        state.cuda_graph_runner = self.cuda_graph_runner
-        state.breakable_cuda_graph_runner = self.breakable_cuda_graph_runner
+        self._runner.cuda_graph_runner = self.cuda_graph_runner
+        self._runner.breakable_cuda_graph_runner = (
+            self.breakable_cuda_graph_runner)
 
     def _initialize_encoder_decoder_runner(
             self,
             runner_cls: Type[EncoderDecoderRunner]) -> EncoderDecoderRunner:
-        runner_config = EncoderDecoderRunnerConfig.create(
-            decoder=self._decoder_runner_config(),
-            model=self.model,
-            mapping=self.mapping,
-            graph_config=self.llm_args.encoder_cuda_graph_config,
-            max_batch_size=self.encoder_batch_size,
-            max_num_tokens=self.encoder_max_num_tokens,
-            max_seq_len=self.max_seq_len,
-            max_beam_width=self.max_beam_width,
-            without_logits=self.without_logits,
-            attention_backend=self.attn_backend,
-            attention_runtime_features=self.attn_runtime_features,
-            enable_autotuner=self.llm_args.enable_autotuner,
-            draft_model=self.is_draft_model,
+        engine = weakref.proxy(self)
+        runner_config = EncoderDecoderRunnerConfig(
+            max_batch_size=self.batch_size,
+            max_num_tokens=self.max_num_tokens,
+            **EncoderDecoderRunnerConfig.encoder_fields(
+                model=self.model,
+                mapping=self.mapping,
+                graph_config=self.llm_args.encoder_cuda_graph_config,
+                encoder_max_batch_size=self.encoder_batch_size,
+                encoder_max_num_tokens=self.encoder_max_num_tokens,
+                max_seq_len=self.max_seq_len,
+                max_beam_width=self.max_beam_width,
+                without_logits=self.without_logits,
+                attention_backend=self.attn_backend,
+                attention_runtime_features=self.attn_runtime_features,
+                enable_autotuner=self.llm_args.enable_autotuner,
+                is_encoder_decoder=True,
+                draft_model=self.is_draft_model,
+            ),
+            **self._decoder_settings(),
         )
         return runner_cls(
             self.model,
             self._create_runner_deps(),
             runner_config,
             self._decoder_runner_buffers(),
-            warmup_flag=lambda: self.is_warmup,
+            warmup_flag=lambda: engine.is_warmup,
         )
 
     def _initialize_no_kv_cache_runner(
@@ -978,16 +1002,8 @@ class PyTorchModelEngine(ModelEngine):
             prefill_cuda_graph_num_tokens=self._prefill_cuda_graph_num_tokens,
             attention_backend=self.attn_backend,
             attention_runtime_features=self.attn_runtime_features,
+            enable_autotuner=self.llm_args.enable_autotuner,
             mm_encoder_cache_enabled=self._mm_encoder_cache_enabled,
-            spec_config=self.spec_config,
-            is_draft_model=self.is_draft_model,
-            num_seq_slots=(self.max_num_seq_slots if
-                           self._enable_disagg_adp_overlap_headroom else None),
-            original_max_draft_len=self.original_max_draft_len,
-            original_max_total_draft_tokens=(
-                self.original_max_total_draft_tokens),
-            spec_dec_max_total_draft_tokens=(
-                self._spec_dec_max_total_draft_tokens),
         )
         return runner_cls(self.model, self._create_runner_deps(), runner_config)
 
@@ -1004,10 +1020,9 @@ class PyTorchModelEngine(ModelEngine):
                                if self.attn_backend.Metadata
                                is TrtllmAttentionMetadata else None),
             lora=self._lora,
+            spec=self._spec,
             moe_load_balancer=self.moe_load_balancer,
-            # Do not retain the engine through a bound method.
-            model_forward=functools.partial(ForwardMixin.model_forward,
-                                            weakref.proxy(self)),
+            model_forward=self._model_caller,
         )
 
     def register_forward_pass_callable(self, callable: Callable):
@@ -1022,7 +1037,7 @@ class PyTorchModelEngine(ModelEngine):
                                       stage: Optional[Callable] = None):
         """Register how a batch maps to its sampling tier, for the graph key."""
         self.cuda_graph_runner.register_sample_type_resolver(resolver)
-        self._runner._ctx.state.stage_in_graph_sampling = stage
+        self._runner.stage_in_graph_sampling = stage
 
     def get_kv_cache_dtype_byte_size(self) -> float:
         """

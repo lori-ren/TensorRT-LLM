@@ -10,7 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import types
+import functools
 from collections import abc, defaultdict
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -27,7 +27,7 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
 )
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.forward import ForwardMixin
+from tensorrt_llm._torch.pyexecutor.engine.runners.common import execute_logit_post_processors
 from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
@@ -538,12 +538,11 @@ class ADEngine(ModelEngine):
         # keep a reference for one dummy request around
         self.padding_dummy_request: Optional[LlmRequest] = None
 
-        # Reuse _execute_logit_post_processors from the decoder family
         self.dist_config = dist_config
         self.mapping = mapping
         self.dist = dist
-        self._execute_logit_post_processors = types.MethodType(
-            ForwardMixin._execute_logit_post_processors, self
+        self._execute_logit_post_processors = functools.partial(
+            execute_logit_post_processors, mapping
         )
 
     def _release_cuda_graphs(self) -> None:

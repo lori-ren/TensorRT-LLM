@@ -91,6 +91,7 @@ def _prepare(
             draft_tokens_cuda=draft_tokens_cuda,
             cache_indirection=None,
             lora=lora,
+            spec=SimpleNamespace(enabled=enable_spec_decode),
             moe_load_balancer=None,
             model_forward=Mock(),
         ),
@@ -106,12 +107,6 @@ def _prepare(
             prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED,
             prefill_cuda_graph_num_tokens=[],
             mm_encoder_cache_enabled=True,
-            spec_config=object() if enable_spec_decode else None,
-            is_draft_model=False,
-            num_seq_slots=None,
-            original_max_draft_len=0,
-            original_max_total_draft_tokens=0,
-            spec_dec_max_total_draft_tokens=0,
         ),
     )
     monkeypatch.setattr(

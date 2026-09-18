@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -22,6 +21,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.mapping import Mapping
 
 from ..lora import LoraParamBuilder
+from ..model_call import ModelCaller
+from ..spec_decode import SpecMetadataBuilder
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
@@ -53,7 +54,11 @@ class PackedEncoderBatch:
 
 @dataclass(frozen=True)
 class RunnerConfig:
-    """Immutable settings shared by encoder, decoder, and no-KV-cache runners."""
+    """Immutable settings every runner reads, for the batch its ``forward`` admits.
+
+    An encoder-decoder's ``forward`` is its decoder half; the encoder phase is a
+    second entry point at its own shape, which ``EncoderConfigMixin`` names.
+    """
 
     max_batch_size: int
     max_num_tokens: int
@@ -62,6 +67,7 @@ class RunnerConfig:
     without_logits: bool
     attention_backend: type[AttentionBackend]
     attention_runtime_features: AttentionRuntimeFeatures
+    enable_autotuner: bool
 
 
 @dataclass(frozen=True)
@@ -77,8 +83,9 @@ class RunnerDeps:
     draft_tokens_cuda: torch.Tensor | None
     cache_indirection: torch.Tensor | None
     lora: LoraParamBuilder
+    spec: SpecMetadataBuilder
     moe_load_balancer: MoeLoadBalancer | None
-    model_forward: Callable[..., Any]
+    model_forward: ModelCaller
 
 
 class ModelRunner(Protocol):

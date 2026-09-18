@@ -50,19 +50,20 @@ from .interface import PackedEncoderBatch, PreparedInputs, RunnerConfig, RunnerD
 class EncoderConfigMixin:
     """Encoder-specific fields shared by runner configuration types."""
 
-    enable_autotuner: bool
-    cuda_graph_enabled: bool
-    cuda_graph_padding_enabled: bool
-    cuda_graph_batch_sizes: list[int]
-    cuda_graph_num_tokens: list[int]
-    cuda_graph_seq_lens: list[int]
-    max_cuda_graph_batch_size: int
-    max_cuda_graph_num_tokens: int
+    encoder_max_batch_size: int
+    encoder_max_num_tokens: int
+    encoder_cuda_graph_enabled: bool
+    encoder_cuda_graph_padding_enabled: bool
+    encoder_cuda_graph_batch_sizes: list[int]
+    encoder_cuda_graph_num_tokens: list[int]
+    encoder_cuda_graph_seq_lens: list[int]
+    encoder_max_cuda_graph_batch_size: int
+    encoder_max_cuda_graph_num_tokens: int
     is_encoder_decoder: bool
     use_fixed_sequence_slots: bool
     feature_shape: tuple[int, ...] | None = None
     feature_dtype: torch.dtype | None = None
-    fixed_seq_len: int | None = None
+    encoder_fixed_seq_len: int | None = None
 
     @classmethod
     def encoder_fields(
@@ -71,8 +72,8 @@ class EncoderConfigMixin:
         model: nn.Module,
         mapping: Mapping,
         graph_config: EncodeCudaGraphConfig | None,
-        max_batch_size: int,
-        max_num_tokens: int,
+        encoder_max_batch_size: int,
+        encoder_max_num_tokens: int,
         max_seq_len: int,
         max_beam_width: int,
         without_logits: bool,
@@ -128,8 +129,8 @@ class EncoderConfigMixin:
         filtered_batch_sizes = (
             filter_cuda_graph_batch_sizes(
                 batch_sizes,
-                max_batch_size,
-                max_num_tokens,
+                encoder_max_batch_size,
+                encoder_max_num_tokens,
                 fixed_seq_len or 1,
                 enable_padding,
             )
@@ -139,7 +140,7 @@ class EncoderConfigMixin:
         filtered_num_tokens = (
             filter_cuda_graph_num_tokens(
                 num_tokens,
-                max_num_tokens,
+                encoder_max_num_tokens,
                 enable_padding,
             )
             if num_tokens
@@ -160,7 +161,8 @@ class EncoderConfigMixin:
             if not graph_shapes_available:
                 logger.warning(
                     "Feature-mode encoder CUDA graphs have no batch size within "
-                    f"the {max_num_tokens} token budget; the encoder phase stays eager."
+                    f"the {encoder_max_num_tokens} token budget; "
+                    "the encoder phase stays eager."
                 )
                 feature_shape = None
                 feature_dtype = None
@@ -183,21 +185,21 @@ class EncoderConfigMixin:
             else (filtered_num_tokens[-1] if filtered_num_tokens else 0)
         )
         return dict(
-            max_batch_size=max_batch_size,
-            max_num_tokens=max_num_tokens,
             max_seq_len=max_seq_len,
             max_beam_width=max_beam_width,
             without_logits=without_logits,
             attention_backend=attention_backend,
             attention_runtime_features=attention_runtime_features,
+            encoder_max_batch_size=encoder_max_batch_size,
+            encoder_max_num_tokens=encoder_max_num_tokens,
             enable_autotuner=enable_autotuner,
-            cuda_graph_enabled=cuda_graph_enabled,
-            cuda_graph_padding_enabled=enable_padding,
-            cuda_graph_batch_sizes=filtered_batch_sizes,
-            cuda_graph_num_tokens=filtered_num_tokens,
-            cuda_graph_seq_lens=filtered_seq_lens,
-            max_cuda_graph_batch_size=max_graph_batch_size,
-            max_cuda_graph_num_tokens=max_graph_num_tokens,
+            encoder_cuda_graph_enabled=cuda_graph_enabled,
+            encoder_cuda_graph_padding_enabled=enable_padding,
+            encoder_cuda_graph_batch_sizes=filtered_batch_sizes,
+            encoder_cuda_graph_num_tokens=filtered_num_tokens,
+            encoder_cuda_graph_seq_lens=filtered_seq_lens,
+            encoder_max_cuda_graph_batch_size=max_graph_batch_size,
+            encoder_max_cuda_graph_num_tokens=max_graph_num_tokens,
             is_encoder_decoder=is_encoder_decoder,
             use_fixed_sequence_slots=(
                 is_encoder_decoder
@@ -208,7 +210,7 @@ class EncoderConfigMixin:
             ),
             feature_shape=feature_shape,
             feature_dtype=feature_dtype,
-            fixed_seq_len=fixed_seq_len,
+            encoder_fixed_seq_len=fixed_seq_len,
         )
 
 
@@ -234,12 +236,14 @@ class EncoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
         draft_model: bool,
     ) -> Self:
         return cls(
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
             **cls.encoder_fields(
                 model=model,
                 mapping=mapping,
                 graph_config=graph_config,
-                max_batch_size=max_batch_size,
-                max_num_tokens=max_num_tokens,
+                encoder_max_batch_size=max_batch_size,
+                encoder_max_num_tokens=max_num_tokens,
                 max_seq_len=max_seq_len,
                 max_beam_width=max_beam_width,
                 without_logits=without_logits,
@@ -248,7 +252,7 @@ class EncoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
                 enable_autotuner=enable_autotuner,
                 is_encoder_decoder=False,
                 draft_model=draft_model,
-            )
+            ),
         )
 
 
@@ -285,28 +289,28 @@ class EncoderMixin:
         config = self._encoder_config
         self._encoder_cuda_graph_runner = EncoderCUDAGraphRunner(
             EncoderCUDAGraphRunnerConfig(
-                use_cuda_graph=config.cuda_graph_enabled,
-                cuda_graph_padding_enabled=config.cuda_graph_padding_enabled,
-                cuda_graph_batch_sizes=config.cuda_graph_batch_sizes,
-                cuda_graph_num_tokens=config.cuda_graph_num_tokens,
-                cuda_graph_seq_lens=config.cuda_graph_seq_lens,
-                max_cuda_graph_batch_size=config.max_cuda_graph_batch_size,
-                max_cuda_graph_num_tokens=config.max_cuda_graph_num_tokens,
-                max_num_tokens=self._config.max_num_tokens,
+                use_cuda_graph=config.encoder_cuda_graph_enabled,
+                cuda_graph_padding_enabled=config.encoder_cuda_graph_padding_enabled,
+                cuda_graph_batch_sizes=config.encoder_cuda_graph_batch_sizes,
+                cuda_graph_num_tokens=config.encoder_cuda_graph_num_tokens,
+                cuda_graph_seq_lens=config.encoder_cuda_graph_seq_lens,
+                max_cuda_graph_batch_size=config.encoder_max_cuda_graph_batch_size,
+                max_cuda_graph_num_tokens=config.encoder_max_cuda_graph_num_tokens,
+                max_num_tokens=self._encoder_config.encoder_max_num_tokens,
                 max_seq_len=self._config.max_seq_len,
                 cuda_graph_mem_pool=None,
                 is_encoder_decoder=config.is_encoder_decoder,
                 use_fixed_sequence_slots=config.use_fixed_sequence_slots,
                 feature_shape=config.feature_shape,
                 feature_dtype=config.feature_dtype,
-                fixed_seq_len=config.fixed_seq_len,
+                fixed_seq_len=config.encoder_fixed_seq_len,
             )
         )
         if config.feature_shape is not None:
             logger.info(
                 "Feature-mode encoder CUDA graphs enabled for batch sizes "
-                f"{config.cuda_graph_batch_sizes} "
-                f"(fixed_seq_len={config.fixed_seq_len}, "
+                f"{config.encoder_cuda_graph_batch_sizes} "
+                f"(fixed_seq_len={config.encoder_fixed_seq_len}, "
                 f"feature_shape={config.feature_shape})."
             )
 
@@ -333,8 +337,8 @@ class EncoderMixin:
     ) -> AttentionMetadata:
         metadata = build_attention_metadata(
             self._model.model_config,
-            max_batch_size=self._config.max_batch_size,
-            max_num_tokens=self._config.max_num_tokens,
+            max_batch_size=self._encoder_config.encoder_max_batch_size,
+            max_num_tokens=self._encoder_config.encoder_max_num_tokens,
             max_beam_width=self._config.max_beam_width,
             attention_backend=self._config.attention_backend,
             attention_runtime_features=self._config.attention_runtime_features,
@@ -446,7 +450,7 @@ class EncoderMixin:
         num_tokens_list = sorted(runner.config.cuda_graph_num_tokens)
         seq_lens_list = sorted(runner.config.cuda_graph_seq_lens)
         for batch_size in batch_sizes:
-            if batch_size > self._config.max_batch_size:
+            if batch_size > self._encoder_config.encoder_max_batch_size:
                 continue
             for seq_len_index, max_seq_len in reversed(list(enumerate(seq_lens_list))):
                 previous_seq_len = seq_lens_list[seq_len_index - 1] if seq_len_index > 0 else 0
@@ -751,8 +755,8 @@ class EncoderRunner(EncoderMixin):
     def warmup(self) -> None:
         AutoTuner.get()
         max_shape = (
-            self._config.max_batch_size,
-            self._config.max_num_tokens,
+            self._encoder_config.encoder_max_batch_size,
+            self._encoder_config.encoder_max_num_tokens,
             self._config.max_seq_len,
         )
         warmup_shapes = list(
@@ -779,8 +783,8 @@ class EncoderRunner(EncoderMixin):
         self._run_warmup_shapes(
             [
                 (
-                    self._config.max_batch_size,
-                    self._config.max_num_tokens,
+                    self._encoder_config.encoder_max_batch_size,
+                    self._encoder_config.encoder_max_num_tokens,
                     self._config.max_seq_len,
                 )
             ]
@@ -816,7 +820,7 @@ class EncoderRunner(EncoderMixin):
                     torch.cuda.empty_cache()
 
     def _run_autotuner_warmup(self) -> None:
-        if not self._encoder_config.enable_autotuner:
+        if not self._config.enable_autotuner:
             return
         AutoTuner.get().setup_distributed_state(self._deps.mapping, self._deps.dist)
         logger.info("Running encoder autotuner warmup...")
@@ -824,8 +828,8 @@ class EncoderRunner(EncoderMixin):
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")
         with cuda_graph_disabled(self._encoder_cuda_graph_runner), autotune(cache_path=cache_path):
             sequence_lengths = self._encoder_cuda_graph_runner.build_capture_sequence_lengths(
-                self._config.max_batch_size,
-                self._config.max_num_tokens,
+                self._encoder_config.encoder_max_batch_size,
+                self._encoder_config.encoder_max_num_tokens,
                 self._config.max_seq_len,
             )
             if sequence_lengths is not None:

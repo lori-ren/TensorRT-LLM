@@ -12,15 +12,11 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFea
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.pyexecutor.engine.runners import encoder as encoder_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import (
-    EncoderConfigMixin,
     EncoderPreparedInputs,
     EncoderRunner,
     EncoderRunnerConfig,
 )
-from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import (
-    EncoderDecoderRunner,
-    EncoderDecoderRunnerConfig,
-)
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PackedEncoderBatch
 from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig
 
@@ -33,7 +29,7 @@ def _encoder_config(
     declares_feature_spec: bool,
     tp_size: int = 1,
     encoder_decoder: bool = False,
-) -> tuple[EncoderConfigMixin, tuple[tuple[int, ...], torch.dtype, int]]:
+) -> tuple[EncoderRunnerConfig, tuple[tuple[int, ...], torch.dtype, int]]:
     feature_spec = ((480_000,), torch.float32, 1_500)
 
     class _Model:
@@ -46,24 +42,26 @@ def _encoder_config(
             def encoder_graph_spec(self) -> tuple[tuple[int, ...], torch.dtype, int]:
                 return feature_spec
 
-    config_type = EncoderDecoderRunnerConfig if encoder_decoder else EncoderRunnerConfig
-    kwargs = dict(
-        model=_Model(),
-        mapping=SimpleNamespace(tp_size=tp_size),
-        graph_config=graph_config,
+    config = EncoderRunnerConfig(
         max_batch_size=8,
         max_num_tokens=8 * 1_500,
-        max_seq_len=1_500,
-        max_beam_width=1,
-        without_logits=False,
-        attention_backend=TrtllmAttention,
-        attention_runtime_features=AttentionRuntimeFeatures(),
-        enable_autotuner=False,
-        draft_model=False,
+        **EncoderRunnerConfig.encoder_fields(
+            model=_Model(),
+            mapping=SimpleNamespace(tp_size=tp_size),
+            graph_config=graph_config,
+            encoder_max_batch_size=8,
+            encoder_max_num_tokens=8 * 1_500,
+            max_seq_len=1_500,
+            max_beam_width=1,
+            without_logits=False,
+            attention_backend=TrtllmAttention,
+            attention_runtime_features=AttentionRuntimeFeatures(),
+            enable_autotuner=False,
+            is_encoder_decoder=encoder_decoder,
+            draft_model=False,
+        ),
     )
-    if encoder_decoder:
-        kwargs["is_encoder_decoder"] = True
-    return config_type.create(**kwargs), feature_spec
+    return config, feature_spec
 
 
 @pytest.mark.parametrize(
@@ -94,15 +92,19 @@ def test_encoder_config_resolves_model_graph_contract(
     )
 
     if expected == "feature":
-        assert (config.feature_shape, config.feature_dtype, config.fixed_seq_len) == feature_spec
-        assert config.cuda_graph_enabled
+        assert (
+            config.feature_shape,
+            config.feature_dtype,
+            config.encoder_fixed_seq_len,
+        ) == feature_spec
+        assert config.encoder_cuda_graph_enabled
     else:
-        assert (config.feature_shape, config.feature_dtype, config.fixed_seq_len) == (
+        assert (config.feature_shape, config.feature_dtype, config.encoder_fixed_seq_len) == (
             None,
             None,
             None,
         )
-        assert config.cuda_graph_enabled == (expected == "token")
+        assert config.encoder_cuda_graph_enabled == (expected == "token")
 
 
 def test_encoder_decoder_token_graph_config_requires_token_and_sequence_buckets() -> None:
@@ -129,7 +131,7 @@ def test_encoder_only_incomplete_graph_config_warns_and_stays_eager() -> None:
         )
 
     assert not config.is_encoder_decoder
-    assert not config.cuda_graph_enabled
+    assert not config.encoder_cuda_graph_enabled
     assert warning.call_count == 1
     assert "stays eager" in warning.call_args.args[0]
 
@@ -143,8 +145,6 @@ def test_encoder_only_attention_metadata_uses_runner_cache_indirection() -> None
     runner = object.__new__(EncoderRunner)
     runner._model = SimpleNamespace(model_config=object())
     runner._config = SimpleNamespace(
-        max_batch_size=4,
-        max_num_tokens=16,
         max_beam_width=2,
         attention_backend=TrtllmAttention,
         attention_runtime_features=AttentionRuntimeFeatures(),
@@ -153,7 +153,11 @@ def test_encoder_only_attention_metadata_uses_runner_cache_indirection() -> None
         mapping=object(),
         cache_indirection=cache_indirection,
     )
-    runner._encoder_config = SimpleNamespace(is_encoder_decoder=False)
+    runner._encoder_config = SimpleNamespace(
+        is_encoder_decoder=False,
+        encoder_max_batch_size=4,
+        encoder_max_num_tokens=16,
+    )
 
     with patch.object(
         encoder_module,
@@ -176,8 +180,6 @@ def test_encoder_decoder_attention_metadata_omits_decoder_cache_indirection() ->
     runner = object.__new__(EncoderDecoderRunner)
     runner._model = SimpleNamespace(model_config=object())
     runner._config = SimpleNamespace(
-        max_batch_size=4,
-        max_num_tokens=16,
         max_beam_width=2,
         attention_backend=TrtllmAttention,
         attention_runtime_features=AttentionRuntimeFeatures(),
@@ -186,7 +188,11 @@ def test_encoder_decoder_attention_metadata_omits_decoder_cache_indirection() ->
         mapping=object(),
         cache_indirection=object(),
     )
-    runner._encoder_config = SimpleNamespace(is_encoder_decoder=True)
+    runner._encoder_config = SimpleNamespace(
+        is_encoder_decoder=True,
+        encoder_max_batch_size=4,
+        encoder_max_num_tokens=16,
+    )
 
     with patch.object(
         encoder_module,

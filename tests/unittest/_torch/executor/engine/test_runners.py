@@ -70,6 +70,7 @@ def _deps(*, model_forward: Mock | None = None) -> RunnerDeps:
         draft_tokens_cuda=None,
         cache_indirection=None,
         lora=SimpleNamespace(build=Mock(return_value=None)),
+        spec=SimpleNamespace(enabled=False),
         moe_load_balancer=None,
         model_forward=model_forward,
     )
@@ -88,12 +89,6 @@ def _config() -> NoKVCacheRunnerConfig:
         prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED,
         prefill_cuda_graph_num_tokens=[],
         mm_encoder_cache_enabled=False,
-        spec_config=None,
-        is_draft_model=False,
-        num_seq_slots=None,
-        original_max_draft_len=0,
-        original_max_total_draft_tokens=0,
-        spec_dec_max_total_draft_tokens=0,
     )
 
 
