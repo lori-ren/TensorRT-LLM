@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.pyexecutor.scheduled_encoder_executor import ScheduledEncoderExecutor
 from tensorrt_llm.executor.utils import RequestError, is_context_length_exceeded_message
 
 from .test_llm import get_model_path
@@ -93,3 +94,18 @@ def test_overlap_loop_completes_requests_that_ask_for_more_tokens():
 
     for got, expected in zip(overlapped, reference):
         assert torch.equal(got, expected)
+
+
+def test_cancelling_a_queued_request_finishes_it(monkeypatch):
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    params = SamplingParams(max_tokens=1, return_context_logits=True)
+
+    with _llm(max_batch_size=1) as llm:
+        assert isinstance(llm._executor.engine, ScheduledEncoderExecutor)
+        futures = [
+            llm.generate_async(_prompt(32, seed=seed), sampling_params=params) for seed in range(50)
+        ]
+        futures[-1].abort()
+        finished = [future.result(timeout=60).outputs[0].finish_reason for future in futures]
+
+    assert finished == ["length"] * 49 + ["cancelled"]
